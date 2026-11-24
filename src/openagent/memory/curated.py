@@ -15,8 +15,9 @@ Three ideas, all from Hermes:
   3. FROZEN. The prompt gets a snapshot taken at session start. Writes mid-session
      reach disk but never change the prompt, so the provider's prefix cache holds.
 
-Entries are separated by "\\n§\\n". The threat list below is a starter set; the
-upstream list lives in Hermes' tools/threat_patterns.py.
+Entries are separated by "\\n§\\n". The threat list below is an expanded, original
+set informed by common prompt-injection and exfil patterns; upstream provenance includes
+Hermes' `tools/threat_patterns.py` (studied for categories, not copied).
 """
 
 from __future__ import annotations
@@ -32,14 +33,49 @@ FILES = {"memory": "MEMORY.md", "user": "USER.md"}
 HEADERS = {"memory": "MEMORY (your personal notes)", "user": "USER PROFILE (who the user is)"}
 
 _THREATS: list[tuple[re.Pattern[str], str]] = [
-    (re.compile(r"ignore\s+(?:all\s+|any\s+)?(?:previous|prior|above)\s+(?:instructions|rules)", re.I),
+    # Instruction override / role reassignment
+    (re.compile(r"ignore\s+(?:all\s+|any\s+)?(?:previous|prior|above|earlier)\s+(?:instructions|rules|messages|prompts?)", re.I),
      "it tries to override earlier instructions"),
-    (re.compile(r"\b(?:you are now|act as if you have no)\b", re.I), "it tries to reassign the assistant's role"),
-    (re.compile(r"(?:\.ssh/|id_rsa|/etc/passwd|\.env\b|credentials\.json)", re.I),
-     "it names a credential file"),
+    (re.compile(r"\b(?:disregard|forget)\s+(?:all\s+)?(?:previous|prior|above|earlier)\s+(?:instructions|rules|context)\b", re.I),
+     "it tries to override earlier instructions"),
+    (re.compile(r"\b(?:you are now|act as if you (?:have no|are)|pretend to be|from now on you are)\b", re.I),
+     "it tries to reassign the assistant's role"),
+    (re.compile(r"\b(?:developer mode|jailbreak|DAN mode|do anything now)\b", re.I),
+     "it contains a jailbreak-style role override"),
+    (re.compile(r"\b(?:system prompt|hidden prompt|initial instructions?)\b.{0,40}\b(?:reveal|show|print|dump|repeat)\b", re.I),
+     "it tries to exfiltrate system instructions"),
+    (re.compile(r"\b(?:reveal|show|print|dump|repeat)\b.{0,40}\b(?:system prompt|hidden prompt|initial instructions?)\b", re.I),
+     "it tries to exfiltrate system instructions"),
+
+    # Credential / secret / sensitive paths
+    (re.compile(r"(?:\.ssh/|id_rsa|id_ed25519|\.gnupg/|/etc/passwd|/etc/shadow|\.env\b|credentials\.json|\.aws/credentials|\.netrc\b)", re.I),
+     "it names a credential or sensitive system file"),
+    (re.compile(r"\b(?:AKIA|ASIA)[0-9A-Z]{16}\b"), "it contains what looks like an AWS access key"),
+    (re.compile(r"\b(?:sk|pk|rk|ghp|gho|ghu|ghs|ghr|xox[baprs]-|AIza)[-_A-Za-z0-9]{16,}\b"),
+     "it contains what looks like an API key or token"),
+    (re.compile(r"-----BEGIN (?:RSA |EC |OPENSSH |DSA )?PRIVATE KEY-----"),
+     "it contains what looks like a private key"),
+
+    # Command execution / exfiltration
     (re.compile(r"curl[^\n|]*\|\s*(?:ba)?sh", re.I), "it pipes a download into a shell"),
-    (re.compile(r"\b(?:sk|pk|ghp|xox[bp])[-_][A-Za-z0-9_-]{16,}"), "it contains what looks like an API key"),
-    (re.compile(r"[\u200b-\u200f\u202a-\u202e\u2060\ufeff]"), "it hides invisible characters"),
+    (re.compile(r"\b(?:wget|curl)\b[^\n]{0,120}\b(?:\||;|&&)\b[^\n]{0,60}\b(?:sh|bash|zsh|python|perl|node)\b", re.I),
+     "it chains a download to command execution"),
+    (re.compile(r"\b(?:rm\s+-rf\s+/|mkfs\.|dd\s+if=|:\(\)\s*\{\s*:\|:\s*&\s*\};:)", re.I),
+     "it contains a destructive shell command"),
+    (re.compile(r"\b(?:powershell|cmd\.exe)\b[^\n]{0,80}\b(?:-enc|-encodedcommand|iex|invoke-expression)\b", re.I),
+     "it contains an encoded or obfuscated shell command"),
+
+    # Exfil / suspicious URLs and markup
+    (re.compile(r"\b(?:send|post|upload|exfiltrate|leak)\b.{0,60}\b(?:https?://|ftp://)\S+", re.I),
+     "it instructs data exfiltration to a URL"),
+    (re.compile(r"https?://\S*(?:webhook\.site|requestbin|ngrok(?:-free)?\.app|pipedream\.net|interact\.sh)\S*", re.I),
+     "it contains a known exfiltration/webhook endpoint"),
+    (re.compile(r"<\s*script\b", re.I), "it contains script markup"),
+    (re.compile(r"\b(?:javascript:|data:text/html)", re.I), "it contains an active URI payload"),
+
+    # Obfuscation / hidden characters
+    (re.compile(r"[\u200b-\u200f\u202a-\u202e\u2060-\u206f\ufeff]"), "it hides invisible characters"),
+    (re.compile(r"(?:&#x?[0-9a-f]+;){8,}", re.I), "it contains suspicious HTML entity obfuscation"),
 ]
 
 

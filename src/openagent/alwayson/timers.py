@@ -6,8 +6,8 @@ Three sources joined:
             run is crash-safe like any message. The external id is `<timer>:<slot>`, so
             a restart that fires the same slot twice is a no-op.
   nanobot   cron/types.py. Three schedule kinds: `at` (once), `every` (an interval),
-            and a calendar rule. Here the calendar rule is `daily` with an optional
-            weekdays-only flag. For full cron expressions, swap `_next_daily` for croniter.
+            and a calendar rule. `daily` supports an optional weekdays-only flag, and `cron`
+            accepts a standard 5-field cron expression (min hour dom month dow).
   OpenClaw  src/cron/active-hours.ts, ported to Python below. A timer may carry a
             wall-clock window. Outside it the timer is DEFERRED, not dropped: it stays
             due and fires on the first poll inside the window.
@@ -55,6 +55,77 @@ def within_active_hours(active: ActiveHours | None, now: datetime) -> bool:
     return start <= minute < end if end > start else (minute >= start or minute < end)
 
 
+
+
+# ---- cron (5-field: min hour dom month dow) --------------------------------------
+def _cron_field(field: str, lo: int, hi: int) -> set[int]:
+    """Parse one cron field into allowed integer values."""
+    values: set[int] = set()
+    for part in field.split(','):
+        part = part.strip()
+        step = 1
+        if '/' in part:
+            part, step_s = part.split('/', 1)
+            step = int(step_s)
+            if step <= 0:
+                raise ValueError(f"invalid cron step: {field!r}")
+        if part == '*':
+            start, end = lo, hi
+        elif '-' in part:
+            a, b = part.split('-', 1)
+            start, end = int(a), int(b)
+        else:
+            start = end = int(part)
+        if start < lo or end > hi or start > end:
+            # allow dow 7 as Sunday
+            if not (lo == 0 and hi == 6 and start == 7 and end == 7):
+                raise ValueError(f"cron value out of range: {field!r}")
+        for v in range(start, end + 1, step):
+            values.add(0 if (lo == 0 and hi == 6 and v == 7) else v)
+    return values
+
+
+def _parse_cron(expr: str) -> tuple[set[int], set[int], set[int], set[int], set[int], bool, bool]:
+    parts = expr.split()
+    if len(parts) != 5:
+        raise ValueError(f"cron expression must have 5 fields (min hour dom month dow), got {expr!r}")
+    mins = _cron_field(parts[0], 0, 59)
+    hours = _cron_field(parts[1], 0, 23)
+    dom = _cron_field(parts[2], 1, 31)
+    month = _cron_field(parts[3], 1, 12)
+    dow = _cron_field(parts[4], 0, 6)
+    dom_star = parts[2].strip() == '*'
+    dow_star = parts[4].strip() == '*'
+    return mins, hours, dom, month, dow, dom_star, dow_star
+
+
+def cron_matches(dt: datetime, expr: str) -> bool:
+    """True when local datetime matches a 5-field cron expression."""
+    mins, hours, dom, month, dow, dom_star, dow_star = _parse_cron(expr)
+    if dt.minute not in mins or dt.hour not in hours or dt.month not in month:
+        return False
+    dom_ok = dt.day in dom
+    cron_dow_py = {0: 6, 1: 0, 2: 1, 3: 2, 4: 3, 5: 4, 6: 5}  # cron 0=Sun -> python weekday
+    dow_ok = dt.weekday() in {cron_dow_py[d] for d in dow}
+    if dom_star and dow_star:
+        return True
+    if dom_star:
+        return dow_ok
+    if dow_star:
+        return dom_ok
+    return dom_ok or dow_ok  # Vixie cron: either matches when both restricted
+
+
+def next_cron(expr: str, tz: str, after: datetime) -> datetime:
+    """Next UTC datetime strictly after `after` that matches the cron expression."""
+    zone = ZoneInfo(tz)
+    local = after.astimezone(zone).replace(second=0, microsecond=0) + timedelta(minutes=1)
+    # cap search to ~2 years to avoid infinite loops on impossible expressions
+    for _ in range(2 * 366 * 24 * 60):
+        if cron_matches(local, expr):
+            return local.astimezone(ZoneInfo("UTC"))
+        local += timedelta(minutes=1)
+    raise ValueError(f"cron expression {expr!r} did not match within search window")
 # ---- schedules (nanobot's kinds) --------------------------------------------------
 
 def _next_daily(spec: str, tz: str, after: datetime) -> datetime:
@@ -78,7 +149,9 @@ def first_fire(kind: str, spec: str, tz: str, now: datetime) -> datetime:
         return now + timedelta(seconds=int(spec))
     if kind == "daily":
         return _next_daily(spec, tz, now)
-    raise ValueError(f"unknown timer kind {kind!r}: at | every | daily")
+    if kind == "cron":
+        return next_cron(spec, tz, now)
+    raise ValueError(f"unknown timer kind {kind!r}: at | every | daily | cron")
 
 
 def add(conn: sqlite3.Connection, *, session_id: str, reply_to: dict, kind: str, spec: str,
@@ -103,6 +176,8 @@ def _advance(row: sqlite3.Row, now: datetime) -> datetime | None:
         while nxt <= now:                      # coalesce every missed slot
             nxt += step
         return nxt
+    if row["kind"] == "cron":
+        return next_cron(row["spec"], row["tz"], now)
     return _next_daily(row["spec"], row["tz"], now)
 
 

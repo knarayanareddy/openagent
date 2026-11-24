@@ -3,13 +3,19 @@ from __future__ import annotations
 
 import argparse
 import json
+import queue
 import sys
+import threading
 from datetime import UTC, datetime
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 
 from openagent import __version__
 from openagent.agent import Fusion
+from openagent.alwayson import events
+from openagent.alwayson.worker import Worker
 from openagent.config import Config
+from openagent.senders import build_senders
 from openagent.testing import ScriptedLLM
 
 
@@ -134,6 +140,87 @@ def cmd_dream(args: argparse.Namespace) -> int:
     return 0
 
 
+
+def cmd_serve(args: argparse.Namespace) -> int:
+    """Run the always-on worker loop with optional HTTP event ingress."""
+    cfg = args.cfg
+    agent = build_agent(cfg)
+    senders = build_senders()
+    worker = Worker(agent, senders, home=cfg.home, batch_wait=args.batch_wait, sleep=lambda s: None)
+    inbox: "queue.Queue[dict]" = queue.Queue()
+
+    class Handler(BaseHTTPRequestHandler):
+        def log_message(self, fmt, *a):  # quiet
+            return
+
+        def _send(self, code: int, payload: dict):
+            body = json.dumps(payload).encode("utf-8")
+            self.send_response(code)
+            self.send_header("content-type", "application/json")
+            self.send_header("content-length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def do_GET(self):  # noqa: N802
+            if self.path == "/health":
+                return self._send(200, {"ok": True, "provider": cfg.provider, "model": cfg.model})
+            return self._send(404, {"error": "not found"})
+
+        def do_POST(self):  # noqa: N802
+            if self.path != "/events":
+                return self._send(404, {"error": "not found"})
+            length = int(self.headers.get("content-length", "0") or 0)
+            try:
+                raw = self.rfile.read(length)
+                payload = json.loads(raw.decode("utf-8") or "{}")
+            except Exception as exc:  # noqa: BLE001
+                return self._send(400, {"error": f"invalid json: {exc}"})
+            text = str(payload.get("text", "")).strip()
+            if not text:
+                return self._send(400, {"error": "text is required"})
+            msg = {
+                "source": str(payload.get("source", "http")),
+                "external_id": str(payload.get("external_id") or f"http-{datetime.now(UTC).timestamp()}"),
+                "session_id": str(payload.get("session_id", "http:default")),
+                "payload": {
+                    "text": text,
+                    "reply_to": payload.get("reply_to") or {"via": "stdout", "chat_id": payload.get("session_id", "http:default")},
+                },
+            }
+            inbox.put(msg)
+            return self._send(202, {"queued": True, "external_id": msg["external_id"]})
+
+    httpd = None
+    if not args.no_http:
+        httpd = HTTPServer((args.host, args.port), Handler)
+        t = threading.Thread(target=httpd.serve_forever, daemon=True)
+        t.start()
+        print(f"[openagent] http ingress on http://{args.host}:{args.port}  POST /events  GET /health", flush=True)
+
+    print(f"[openagent] serve loop started provider={cfg.provider} home={cfg.home}", flush=True)
+    worker.start(_now())
+    try:
+        while True:
+            # drain HTTP inbox into sqlite (main thread owns sqlite connection)
+            while True:
+                try:
+                    msg = inbox.get_nowait()
+                except queue.Empty:
+                    break
+                events.insert(agent.conn, source=msg["source"], external_id=msg["external_id"],
+                              session_id=msg["session_id"], payload=msg["payload"], now=_now())
+            result = worker.tick(_now())
+            if result.handled != "idle":
+                print(f"[openagent] handled={result.handled} session={result.session_id} parked={result.parked}", flush=True)
+            threading.Event().wait(args.poll)
+    except KeyboardInterrupt:
+        print("\n[openagent] stopping...", flush=True)
+    finally:
+        worker.stop()
+        if httpd is not None:
+            httpd.shutdown()
+    return 0
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="openagent", description="OpenAgent - a personal agent harness")
     p.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
@@ -163,6 +250,14 @@ def build_parser() -> argparse.ArgumentParser:
 
     s = sub.add_parser("demo", help="Run the scripted end-to-end demo")
     s.set_defaults(func=cmd_demo)
+
+    s = sub.add_parser("serve", help="Run always-on worker loop with optional HTTP ingress")
+    s.add_argument("--host", default="127.0.0.1", help="HTTP bind host")
+    s.add_argument("--port", type=int, default=8787, help="HTTP bind port")
+    s.add_argument("--poll", type=float, default=2.0, help="Worker poll interval seconds")
+    s.add_argument("--batch-wait", type=float, default=0.2, help="Batch wait seconds for same-session events")
+    s.add_argument("--no-http", action="store_true", help="Disable HTTP ingress")
+    s.set_defaults(func=cmd_serve)
 
     return p
 

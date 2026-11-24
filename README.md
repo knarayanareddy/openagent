@@ -16,7 +16,7 @@ deterministic tests.
 - **Dream consolidation** — cursor-based distillation with guards (drops ops state, restatements, duplicates), git-auditable memory directory, wiki export.
 - **Always-on primitives** — event inbox with dedupe, outbox with idempotency/backoff/dead-letter, timers (`at/every/daily` + active-hours defer-not-drop), parked approvals, startup circuit breaker.
 - **Provider adapters** — Anthropic Messages API and OpenAI Chat Completions (stdlib urllib, no required SDK). ScriptedLLM for offline/demo mode.
-- **CLI** — `openagent chat`, `openagent ask`, `openagent demo`, `openagent dream`, `openagent info`.
+- **CLI** — `openagent chat`, `openagent ask`, `openagent serve`, `openagent demo`, `openagent dream`, `openagent info`.
 
 ## Quickstart
 
@@ -29,6 +29,9 @@ python -m pytest -q
 
 # Run the scripted end-to-end demo
 openagent demo
+
+# Run always-on worker with HTTP ingress
+openagent serve --host 127.0.0.1 --port 8787
 # or
 python -m openagent demo
 
@@ -83,12 +86,13 @@ openagent ask "Book a catch-up with Alex on Friday" --session work
 │   ├── llm.py               # Internal LLM dialect
 │   ├── loop.py              # 3-exit agent loop
 │   ├── testing.py           # ScriptedLLM for deterministic evals
+│   ├── senders.py           # Outbound senders (stdout/webhook/Telegram)
 │   ├── tools.py             # Tool registry + built-ins + rules
 │   ├── trace.py             # Observer/trace
 │   ├── alwayson/            # inbox, outbox, approvals, timers, breaker, worker
 │   ├── memory/              # curated, semantic, gate, dream, audit
 │   └── providers/           # Anthropic/OpenAI adapters
-├── tests/                   # Deterministic pytest suite (35 tests)
+├── tests/                   # Deterministic pytest suite (42 tests)
 ├── examples/                # Demo script
 ├── prototypes/reference/    # Reference slices from studied repos (original languages)
 ├── review/                  # Review preview app + built artifact

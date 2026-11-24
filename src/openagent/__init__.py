@@ -15,11 +15,11 @@ No Waku name/mark or hosted/ ELv2 code is included. See NOTICE.md.
 from openagent.agent import Fusion, Turn
 from openagent.guard import Guard
 from openagent.llm import LLM, Response
-from openagent.testing import ScriptedLLM
+from openagent.testing import ReplayLLM, ScriptedLLM
 from openagent.tools import ToolRegistry, default_tools, default_rules
 
 __all__ = [
-    "Fusion", "Turn", "Guard", "LLM", "Response", "ScriptedLLM",
+    "Fusion", "Turn", "Guard", "LLM", "Response", "ScriptedLLM", "ReplayLLM",
     "ToolRegistry", "default_tools", "default_rules",
 ]
 __version__ = "0.1.0"
