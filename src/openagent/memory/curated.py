@@ -25,6 +25,7 @@ from __future__ import annotations
 import os
 import re
 import tempfile
+import unicodedata
 from pathlib import Path
 
 ENTRY_DELIMITER = "\n§\n"
@@ -36,7 +37,7 @@ _THREATS: list[tuple[re.Pattern[str], str]] = [
     # Instruction override / role reassignment
     (re.compile(r"ignore\s+(?:all\s+|any\s+)?(?:previous|prior|above|earlier)\s+(?:instructions|rules|messages|prompts?)", re.I),
      "it tries to override earlier instructions"),
-    (re.compile(r"\b(?:disregard|forget)\s+(?:all\s+)?(?:previous|prior|above|earlier)\s+(?:instructions|rules|context)\b", re.I),
+    (re.compile(r"\b(?:disregard|forget)\s+(?:all\s+)?(?:previous|prior|above|earlier)\s+(?:instructions|rules|context|directives|messages|prompts)\b", re.I),
      "it tries to override earlier instructions"),
     (re.compile(r"\b(?:you are now|act as if you (?:have no|are)|pretend to be|from now on you are)\b", re.I),
      "it tries to reassign the assistant's role"),
@@ -81,8 +82,9 @@ _THREATS: list[tuple[re.Pattern[str], str]] = [
 
 def scan(content: str) -> str | None:
     """Why this text may not enter memory, or None when it is clean."""
+    normalized = unicodedata.normalize("NFKC", content)
     for pattern, reason in _THREATS:
-        if pattern.search(content):
+        if pattern.search(content) or pattern.search(normalized):
             return reason
     return None
 

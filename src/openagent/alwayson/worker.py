@@ -98,7 +98,7 @@ class Worker:
                         if not arg:
                             out.handled, out.reply = "command", "Usage: /revert <sha>"
                         else:
-                            ok = self.fusion.audit.revert(arg)
+                            ok = self.fusion.audit.revert(arg, self.fusion.semantic)
                             out.handled, out.reply = "command", (f"Reverted {arg}." if ok else f"Could not revert {arg}.")
                     else:
                         out.handled, out.reply = "command", f"Unknown admin command {command}."

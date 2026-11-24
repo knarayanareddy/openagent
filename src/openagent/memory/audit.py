@@ -53,9 +53,12 @@ class MemoryAudit:
             return []
         return [tuple(line.split("\t", 1)) for line in log.stdout.splitlines()]  # type: ignore[misc]
 
-    def revert(self, sha: str) -> bool:
+    def revert(self, sha: str, semantic: SemanticMemory | None = None) -> bool:
         done = self._git("revert", "--no-edit", sha)
-        return bool(done and done.returncode == 0)
+        ok = bool(done and done.returncode == 0)
+        if ok and semantic is not None:
+            semantic.sync_from_wiki(self.root / "wiki" / "facts.md")
+        return ok
 
 
 def export_wiki(semantic: SemanticMemory, root: Path) -> Path:

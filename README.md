@@ -96,7 +96,6 @@ openagent ask "Book a catch-up with Alex on Friday" --session work
 ├── examples/                # Demo script
 ├── prototypes/reference/    # Reference slices from studied repos (original languages)
 ├── review/                  # Review preview app + built artifact
-├── docs/                    # Design/review notes
 ├── NOTICE.md                # Attribution and provenance
 └── pyproject.toml
 ```
@@ -143,7 +142,7 @@ upstream `hosted/` ELv2 code is included. See [NOTICE.md](NOTICE.md).
 ## Review artifact
 
 The original review/preview package is preserved under `review/`. The built preview is
-`review/waku-fusion-review.html` (static report artifact).
+`review/openagent-review.html` (static report artifact).
 
 ## Development
 

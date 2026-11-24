@@ -11,6 +11,9 @@ from __future__ import annotations
 
 import re
 import sqlite3
+from pathlib import Path
+
+from openagent.memory.curated import scan as scan_threat
 
 
 def fts_query(text: str) -> str:
@@ -30,6 +33,8 @@ class SemanticMemory:
         self.conn = conn
 
     def add_fact(self, subject: str, content: str, source: str = "user") -> int:
+        if scan_threat(f"{subject} {content}") is not None:
+            return -1
         cur = self.conn.execute("INSERT INTO facts (subject, content, source) VALUES (?, ?, ?)",
                                 (subject, content, source))
         self.conn.commit()
@@ -77,3 +82,32 @@ class SemanticMemory:
         lines = [f"- {f['content']}" for f in facts]
         lines += [f"- ({e['happened_at']}) {e['summary']}" for e in episodes]
         return "\n".join(lines)
+
+
+    def replace_all_facts(self, facts: list[dict]) -> None:
+        """Replace all facts (used by audit revert sync)."""
+        self.conn.execute("DELETE FROM facts")
+        for f in facts:
+            subject = str(f.get("subject", "")).strip()
+            content = str(f.get("content", "")).strip()
+            source = str(f.get("source", "wiki"))
+            if subject and content:
+                self.conn.execute("INSERT INTO facts (subject, content, source) VALUES (?, ?, ?)",
+                                  (subject, content, source))
+        self.conn.commit()
+
+    def sync_from_wiki(self, wiki_path: str | Path) -> int:
+        """Rebuild facts table from a wiki/facts.md export. Returns number of facts loaded."""
+        path = Path(wiki_path)
+        if not path.exists():
+            self.replace_all_facts([])
+            return 0
+        subject = ""
+        facts: list[dict] = []
+        for line in path.read_text(encoding="utf-8").splitlines():
+            if line.startswith("## "):
+                subject = line[3:].strip()
+            elif line.startswith("- ") and subject:
+                facts.append({"subject": subject, "content": line[2:].strip(), "source": "wiki"})
+        self.replace_all_facts(facts)
+        return len(facts)
