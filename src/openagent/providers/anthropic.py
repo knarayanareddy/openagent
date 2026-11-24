@@ -48,10 +48,10 @@ class AnthropicProvider:
             payload["system"] = system
         if tools:
             payload["tools"] = tools
-        if tool_choice == "none":
-            payload["tool_choice"] = {"type": "none"}
-        elif tool_choice == "any":
-            payload["tool_choice"] = {"type": "any"}
+            if tool_choice == "none":
+                payload["tool_choice"] = {"type": "none"}
+            elif tool_choice == "any":
+                payload["tool_choice"] = {"type": "any"}
 
         body = json.dumps(payload).encode("utf-8")
         req = urllib.request.Request(

@@ -2,10 +2,14 @@
 from __future__ import annotations
 
 import argparse
+import hmac
 import json
+import os
 import queue
 import sys
 import threading
+import time
+import uuid
 from datetime import UTC, datetime
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
@@ -146,10 +150,32 @@ def cmd_serve(args: argparse.Namespace) -> int:
     cfg = args.cfg
     agent = build_agent(cfg)
     senders = build_senders()
-    worker = Worker(agent, senders, home=cfg.home, batch_wait=args.batch_wait, sleep=lambda s: None)
-    inbox: "queue.Queue[dict]" = queue.Queue()
+    inbox: "queue.Queue[dict]" = queue.Queue(maxsize=256)
+
+    def drain_inbox() -> None:
+        while True:
+            try:
+                msg = inbox.get_nowait()
+            except queue.Empty:
+                break
+            events.insert(agent.conn, source=msg["source"], external_id=msg["external_id"],
+                          session_id=msg["session_id"], payload=msg["payload"], now=_now())
+
+    def wait_and_drain(seconds: float) -> None:
+        if seconds > 0:
+            time.sleep(seconds)
+        drain_inbox()
+
+    worker = Worker(agent, senders, home=cfg.home, batch_wait=args.batch_wait, sleep=wait_and_drain)
+
+    ingress_token = (args.token or os.environ.get("OPENAGENT_INGRESS_TOKEN", "")).strip()
+    max_body = args.max_body
+    if args.host not in ("127.0.0.1", "localhost", "::1") and not ingress_token:
+        print("[openagent] WARNING: non-loopback serve without OPENAGENT_INGRESS_TOKEN; /events is unauthenticated", flush=True)
 
     class Handler(BaseHTTPRequestHandler):
+        timeout = 10
+
         def log_message(self, fmt, *a):  # quiet
             return
 
@@ -169,7 +195,16 @@ def cmd_serve(args: argparse.Namespace) -> int:
         def do_POST(self):  # noqa: N802
             if self.path != "/events":
                 return self._send(404, {"error": "not found"})
-            length = int(self.headers.get("content-length", "0") or 0)
+            if ingress_token:
+                auth = self.headers.get("authorization", "")
+                if not hmac.compare_digest(auth, f"Bearer {ingress_token}"):
+                    return self._send(401, {"error": "unauthorized"})
+            try:
+                length = int(self.headers.get("content-length", "0") or 0)
+            except ValueError:
+                return self._send(400, {"error": "invalid content-length"})
+            if length <= 0 or length > max_body:
+                return self._send(413, {"error": f"content-length must be 1..{max_body}"})
             try:
                 raw = self.rfile.read(length)
                 payload = json.loads(raw.decode("utf-8") or "{}")
@@ -178,16 +213,23 @@ def cmd_serve(args: argparse.Namespace) -> int:
             text = str(payload.get("text", "")).strip()
             if not text:
                 return self._send(400, {"error": "text is required"})
+            session_id = str(payload.get("session_id", "http:default"))
+            # Namespace untrusted HTTP sessions to prevent owner spoofing when no token is configured.
+            if not ingress_token and session_id == cfg.owner:
+                session_id = f"http:{session_id}"
             msg = {
                 "source": str(payload.get("source", "http")),
-                "external_id": str(payload.get("external_id") or f"http-{datetime.now(UTC).timestamp()}"),
-                "session_id": str(payload.get("session_id", "http:default")),
+                "external_id": str(payload.get("external_id") or f"http-{uuid.uuid4().hex}"),
+                "session_id": session_id,
                 "payload": {
                     "text": text,
-                    "reply_to": payload.get("reply_to") or {"via": "stdout", "chat_id": payload.get("session_id", "http:default")},
+                    "reply_to": payload.get("reply_to") or {"via": "stdout", "chat_id": session_id},
                 },
             }
-            inbox.put(msg)
+            try:
+                inbox.put_nowait(msg)
+            except queue.Full:
+                return self._send(503, {"error": "inbox queue full"})
             return self._send(202, {"queued": True, "external_id": msg["external_id"]})
 
     httpd = None
@@ -199,24 +241,21 @@ def cmd_serve(args: argparse.Namespace) -> int:
 
     print(f"[openagent] serve loop started provider={cfg.provider} home={cfg.home}", flush=True)
     worker.start(_now())
+    clean_shutdown = False
     try:
         while True:
-            # drain HTTP inbox into sqlite (main thread owns sqlite connection)
-            while True:
-                try:
-                    msg = inbox.get_nowait()
-                except queue.Empty:
-                    break
-                events.insert(agent.conn, source=msg["source"], external_id=msg["external_id"],
-                              session_id=msg["session_id"], payload=msg["payload"], now=_now())
+            drain_inbox()
             result = worker.tick(_now())
             if result.handled != "idle":
                 print(f"[openagent] handled={result.handled} session={result.session_id} parked={result.parked}", flush=True)
+                continue  # drain/process pending work before sleeping
             threading.Event().wait(args.poll)
     except KeyboardInterrupt:
+        clean_shutdown = True
         print("\n[openagent] stopping...", flush=True)
     finally:
-        worker.stop()
+        if clean_shutdown:
+            worker.stop()  # reset breaker only on clean shutdown
         if httpd is not None:
             httpd.shutdown()
     return 0
@@ -256,6 +295,8 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--port", type=int, default=8787, help="HTTP bind port")
     s.add_argument("--poll", type=float, default=2.0, help="Worker poll interval seconds")
     s.add_argument("--batch-wait", type=float, default=0.2, help="Batch wait seconds for same-session events")
+    s.add_argument("--token", default="", help="Ingress bearer token (or OPENAGENT_INGRESS_TOKEN)")
+    s.add_argument("--max-body", type=int, default=65536, help="Max HTTP request body bytes")
     s.add_argument("--no-http", action="store_true", help="Disable HTTP ingress")
     s.set_defaults(func=cmd_serve)
 

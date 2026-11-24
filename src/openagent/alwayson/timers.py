@@ -61,6 +61,7 @@ def within_active_hours(active: ActiveHours | None, now: datetime) -> bool:
 def _cron_field(field: str, lo: int, hi: int) -> set[int]:
     """Parse one cron field into allowed integer values."""
     values: set[int] = set()
+    hi_bound = 7 if (lo == 0 and hi == 6) else hi  # allow DOW 7 as Sunday
     for part in field.split(','):
         part = part.strip()
         step = 1
@@ -76,10 +77,8 @@ def _cron_field(field: str, lo: int, hi: int) -> set[int]:
             start, end = int(a), int(b)
         else:
             start = end = int(part)
-        if start < lo or end > hi or start > end:
-            # allow dow 7 as Sunday
-            if not (lo == 0 and hi == 6 and start == 7 and end == 7):
-                raise ValueError(f"cron value out of range: {field!r}")
+        if start < lo or end > hi_bound or start > end:
+            raise ValueError(f"cron value out of range: {field!r}")
         for v in range(start, end + 1, step):
             values.add(0 if (lo == 0 and hi == 6 and v == 7) else v)
     return values
@@ -96,6 +95,10 @@ def _parse_cron(expr: str) -> tuple[set[int], set[int], set[int], set[int], set[
     dow = _cron_field(parts[4], 0, 6)
     dom_star = parts[2].strip() == '*'
     dow_star = parts[4].strip() == '*'
+    # Reject impossible day/month combinations (e.g. Feb 31, Apr 31)
+    max_days = {1: 31, 2: 29, 3: 31, 4: 30, 5: 31, 6: 30, 7: 31, 8: 31, 9: 30, 10: 31, 11: 30, 12: 31}
+    if not dom_star and not any(any(d <= max_days[m] for d in dom) for m in month):
+        raise ValueError(f"impossible calendar date in cron expression: {expr!r}")
     return mins, hours, dom, month, dow, dom_star, dow_star
 
 
@@ -119,12 +122,27 @@ def cron_matches(dt: datetime, expr: str) -> bool:
 def next_cron(expr: str, tz: str, after: datetime) -> datetime:
     """Next UTC datetime strictly after `after` that matches the cron expression."""
     zone = ZoneInfo(tz)
-    local = after.astimezone(zone).replace(second=0, microsecond=0) + timedelta(minutes=1)
-    # cap search to ~2 years to avoid infinite loops on impossible expressions
-    for _ in range(2 * 366 * 24 * 60):
-        if cron_matches(local, expr):
-            return local.astimezone(ZoneInfo("UTC"))
-        local += timedelta(minutes=1)
+    mins, hours, dom, month, dow, dom_star, dow_star = _parse_cron(expr)
+    cron_dow_py = {0: 6, 1: 0, 2: 1, 3: 2, 4: 3, 5: 4, 6: 5}
+    # Step in UTC to avoid DST fall-back fold resets / skipped repeated-hour bugs.
+    cur_utc = after.astimezone(ZoneInfo("UTC")).replace(second=0, microsecond=0) + timedelta(minutes=1)
+    for _ in range(8 * 366 * 24 * 60):  # 8 years covers leap-day schedules
+        local = cur_utc.astimezone(zone)
+        if local.minute in mins and local.hour in hours and local.month in month:
+            dom_ok = local.day in dom
+            dow_ok = local.weekday() in {cron_dow_py[d] for d in dow}
+            day_ok = dom_ok and dow_ok if (not dom_star and not dow_star) else (dow_ok if dom_star else (dom_ok if dow_star else True))
+            if not dom_star and not dow_star:
+                day_ok = dom_ok or dow_ok
+            elif dom_star and dow_star:
+                day_ok = True
+            elif dom_star:
+                day_ok = dow_ok
+            else:
+                day_ok = dom_ok
+            if day_ok:
+                return cur_utc
+        cur_utc += timedelta(minutes=1)
     raise ValueError(f"cron expression {expr!r} did not match within search window")
 # ---- schedules (nanobot's kinds) --------------------------------------------------
 

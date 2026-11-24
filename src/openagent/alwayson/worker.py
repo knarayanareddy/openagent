@@ -22,7 +22,7 @@ from pathlib import Path
 
 from openagent.agent import Fusion
 from openagent.alwayson import approvals, breaker, events, outbox, timers
-from openagent.guard import DENY_CMD, FILTER, gate_command
+from openagent.guard import ADMIN_COMMANDS, DENY_CMD, FILTER, gate_command
 
 
 @dataclass
@@ -84,6 +84,25 @@ class Worker:
                 if verdict in (FILTER, DENY_CMD):
                     out.handled, out.reply = "command", ("" if verdict == FILTER else "Permission denied.")
                     self.observer("command", {"title": f"{command} {verdict}"})
+                elif verdict == "pass" and command in ADMIN_COMMANDS and self.is_owner(event.session_id):
+                    arg = text.strip().split(None, 1)[1].strip() if len(text.strip().split(None, 1)) > 1 else ""
+                    if command == "/clear":
+                        self.fusion.new_session(event.session_id)
+                        self.conn.execute("DELETE FROM chat_log WHERE session_id = ?", (event.session_id,))
+                        self.conn.commit()
+                        out.handled, out.reply = "command", "Session cleared."
+                    elif command == "/dream":
+                        res = self.fusion.run_dream(now, force=True)
+                        out.handled, out.reply = "command", f"Dream ran={res.ran} kept={len(res.kept)} dropped={len(res.dropped)} commit={res.commit or 'none'}"
+                    elif command == "/revert":
+                        if not arg:
+                            out.handled, out.reply = "command", "Usage: /revert <sha>"
+                        else:
+                            ok = self.fusion.audit.revert(arg)
+                            out.handled, out.reply = "command", (f"Reverted {arg}." if ok else f"Could not revert {arg}.")
+                    else:
+                        out.handled, out.reply = "command", f"Unknown admin command {command}."
+                    self.observer("command", {"title": f"{command} executed", "reply": out.reply})
                 else:
                     turn = self.fusion.respond(event.session_id, text, reply_to, now)
                     out.handled, out.reply, out.parked = "run", turn.reply, turn.loop.parked

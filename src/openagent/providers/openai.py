@@ -141,10 +141,10 @@ class OpenAIProvider:
         }
         if tools:
             payload["tools"] = _tools_to_openai(tools)
-        if tool_choice == "none":
-            payload["tool_choice"] = "none"
-        elif tool_choice == "any":
-            payload["tool_choice"] = "required"
+            if tool_choice == "none":
+                payload["tool_choice"] = "none"
+            elif tool_choice == "any":
+                payload["tool_choice"] = "required"
 
         body = json.dumps(payload).encode("utf-8")
         req = urllib.request.Request(

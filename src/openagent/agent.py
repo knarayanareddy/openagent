@@ -104,12 +104,13 @@ class Fusion:
             if decision.verdict == DENY:
                 return DENY, f"Refused by the guard: {decision.reason}"
             if decision.verdict == HOLD:
+                target = outbox.parse_address(self.owner)
+                if target is None:
+                    return DENY, f"Owner address {self.owner!r} is not a routable address; cannot request approval."
                 digest = approvals.park(self.conn, approver=self.owner, origin_session=session_id,
                                         origin_address=origin_address, tool=name, args=args, now=now)
                 if digest is None:
                     return DENY, "Another call is already waiting for the owner's yes. Try later."
-                target = outbox.parse_address(self.owner)
-                assert target is not None
                 outbox.insert(self.conn, run_id=run_id, channel=target[0], target=target[1],
                               body=approvals.question(name, args), idempotency_key=f"approval:{digest}",
                               now=now)

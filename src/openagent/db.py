@@ -31,6 +31,11 @@ CREATE TRIGGER IF NOT EXISTS facts_ad AFTER DELETE ON facts BEGIN
     INSERT INTO facts_fts(facts_fts, rowid, subject, content)
     VALUES ('delete', old.id, old.subject, old.content);
 END;
+CREATE TRIGGER IF NOT EXISTS facts_au AFTER UPDATE ON facts BEGIN
+    INSERT INTO facts_fts(facts_fts, rowid, subject, content)
+    VALUES ('delete', old.id, old.subject, old.content);
+    INSERT INTO facts_fts(rowid, subject, content) VALUES (new.id, new.subject, new.content);
+END;
 
 -- Episodic memory: dated things that happened.
 CREATE TABLE IF NOT EXISTS episodes (
@@ -42,6 +47,15 @@ CREATE VIRTUAL TABLE IF NOT EXISTS episodes_fts USING fts5(
     summary, content=episodes, content_rowid=id
 );
 CREATE TRIGGER IF NOT EXISTS episodes_ai AFTER INSERT ON episodes BEGIN
+    INSERT INTO episodes_fts(rowid, summary) VALUES (new.id, new.summary);
+END;
+CREATE TRIGGER IF NOT EXISTS episodes_ad AFTER DELETE ON episodes BEGIN
+    INSERT INTO episodes_fts(episodes_fts, rowid, summary)
+    VALUES ('delete', old.id, old.summary);
+END;
+CREATE TRIGGER IF NOT EXISTS episodes_au AFTER UPDATE ON episodes BEGIN
+    INSERT INTO episodes_fts(episodes_fts, rowid, summary)
+    VALUES ('delete', old.id, old.summary);
     INSERT INTO episodes_fts(rowid, summary) VALUES (new.id, new.summary);
 END;
 
@@ -135,6 +149,7 @@ def connect(home: Path) -> sqlite3.Connection:
     conn = sqlite3.connect(home / "state.db")
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA busy_timeout=5000")
     conn.executescript(SCHEMA)
     conn.commit()
     return conn
