@@ -110,3 +110,76 @@ def test_serve_http_rate_limit(tmp_path: Path):
             p.wait(timeout=5)
         except subprocess.TimeoutExpired:
             p.kill()
+
+
+def _options(url: str, origin: str = "http://localhost:3000"):
+    req = urllib.request.Request(url, headers={"origin": origin}, method="OPTIONS")
+    with urllib.request.urlopen(req, timeout=5) as r:
+        return r.status, dict(r.headers.items())
+
+
+def test_serve_http_cors_audit_and_payload_limit(tmp_path: Path):
+    port = _free_port()
+    env = os.environ.copy()
+    env["PYTHONPATH"] = str(Path(__file__).resolve().parents[1] / "src")
+    env["OPENAGENT_HOME"] = str(tmp_path / "home")
+    env["OPENAGENT_PROVIDER"] = "scripted"
+    cmd = [sys.executable, "-m", "openagent", "serve", "--host", "127.0.0.1", "--port", str(port),
+           "--poll", "0.1", "--batch-wait", "0", "--token", "secret", "--max-body", "64",
+           "--cors-origin", "http://localhost:3000"]
+    p = subprocess.Popen(cmd, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    try:
+        _wait_health(f"http://127.0.0.1:{port}/health")
+        status, headers = _options(f"http://127.0.0.1:{port}/events")
+        assert status == 204
+        assert headers.get("access-control-allow-origin") == "http://localhost:3000"
+
+        code, _ = _post(f"http://127.0.0.1:{port}/events", {"text": "x" * 200}, token="secret")
+        assert code == 413
+
+        code, _ = _post(f"http://127.0.0.1:{port}/events", {"text": "ok"}, token="secret")
+        assert code == 202
+        audit = tmp_path / "home" / "logs" / "ingress.jsonl"
+        for _ in range(30):
+            if audit.exists() and audit.read_text().strip():
+                break
+            time.sleep(0.1)
+        assert audit.exists()
+        lines = [json.loads(l) for l in audit.read_text().splitlines() if l.strip()]
+        assert any(l.get("status") == 413 for l in lines)
+        assert any(l.get("status") == 202 for l in lines)
+    finally:
+        p.terminate()
+        try:
+            p.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            p.kill()
+
+
+def test_serve_http_concurrent_clients(tmp_path: Path):
+    import threading
+    port = _free_port()
+    env = os.environ.copy()
+    env["PYTHONPATH"] = str(Path(__file__).resolve().parents[1] / "src")
+    env["OPENAGENT_HOME"] = str(tmp_path / "home")
+    env["OPENAGENT_PROVIDER"] = "scripted"
+    cmd = [sys.executable, "-m", "openagent", "serve", "--host", "127.0.0.1", "--port", str(port),
+           "--poll", "0.1", "--batch-wait", "0", "--token", "secret", "--rate-limit", "100"]
+    p = subprocess.Popen(cmd, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    results = []
+    try:
+        _wait_health(f"http://127.0.0.1:{port}/health")
+        def hit(i):
+            code, _ = _post(f"http://127.0.0.1:{port}/events", {"text": f"hi {i}", "session_id": f"s{i}"}, token="secret")
+            results.append(code)
+        threads = [threading.Thread(target=hit, args=(i,)) for i in range(8)]
+        for t in threads: t.start()
+        for t in threads: t.join(timeout=10)
+        assert len(results) == 8
+        assert all(c == 202 for c in results)
+    finally:
+        p.terminate()
+        try:
+            p.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            p.kill()

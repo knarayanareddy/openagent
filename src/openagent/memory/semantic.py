@@ -105,8 +105,8 @@ class SemanticMemory:
         if ep.exists():
             self._sync_episodes_from_wiki(ep)
         else:
-            # legacy wiki exports did not include episodes; keep existing episodes
-            pass
+            # Legacy wiki snapshots predate episodes.md; clear to avoid split-brain.
+            self.replace_all_episodes([])
         return len(facts)
 
     def _sync_episodes_from_wiki(self, path: str | Path) -> int:
@@ -133,8 +133,13 @@ class SemanticMemory:
     def recall_text(self, query: str) -> str:
         facts = self.search(query)
         episodes = self.search_episodes(query)
-        lines = [f"- {f['content']}" for f in facts]
-        lines += [f"- ({e['happened_at']}) {e['summary']}" for e in episodes]
+        lines = []
+        for f in facts:
+            if scan_threat(f"{f.get('subject','')} {f.get('content','')}") is None:
+                lines.append(f"- {f['content']}")
+        for e in episodes:
+            if scan_threat(str(e.get("summary", ""))) is None:
+                lines.append(f"- ({e['happened_at']}) {e['summary']}")
         return "\n".join(lines)
 
 

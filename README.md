@@ -73,9 +73,11 @@ Security defaults / controls:
 - **Bind loopback by default.** Non-loopback binds require `--token`/`OPENAGENT_INGRESS_TOKEN` unless `--allow-unauthenticated` is explicitly set (unsafe).
 - **Bearer auth.** When a token is configured, `/events` requires `Authorization: Bearer <token>`.
 - **Durable-before-ack.** HTTP ingress writes events directly to SQLite before returning 202 (disable with `--no-durable-ingress` only if you accept at-most-once in-memory queuing).
-- **Rate limiting.** Per-IP fixed window, default 60 req/min (`--rate-limit`).
+- **Rate limiting.** Per-IP fixed window, default 60 req/min (`--rate-limit`), 429 with `Retry-After`.
 - **Body limits / timeouts.** `--max-body` (default 64KB), content-length validation, socket timeout.
 - **Session namespacing.** Without token auth, untrusted HTTP requests cannot claim the configured owner session id directly.
+- **Audit log.** Ingress decisions are appended to `logs/ingress.jsonl` under the OpenAgent home.
+- **CORS.** Optional `--cors-origin` for browser clients; otherwise CORS headers are not emitted.
 - **TLS / reverse proxy.** OpenAgent serve does not terminate TLS. For internet/public exposure, run behind a TLS reverse proxy (nginx/Caddy/Envoy/etc.), keep the app bound to loopback/private interface, forward only required paths, set auth/rate limits at the edge too, and monitor logs/DB.
 
 ## Configuration

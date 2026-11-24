@@ -210,6 +210,17 @@ def cmd_serve(args: argparse.Namespace) -> int:
     ingress_conn = sqlite3.connect(cfg.home / "state.db", check_same_thread=False)
     ingress_conn.row_factory = sqlite3.Row
     ingress_conn.execute("PRAGMA busy_timeout=5000")
+    cors_origin = str(getattr(args, "cors_origin", "") or "").strip()
+    audit_path = cfg.home / "logs" / "ingress.jsonl"
+    audit_path.parent.mkdir(parents=True, exist_ok=True)
+    audit_lock = threading.Lock()
+
+    def audit(entry: dict) -> None:
+        entry = {"ts": _now().isoformat(), **entry}
+        line = json.dumps(entry, ensure_ascii=False, default=str)
+        with audit_lock:
+            with audit_path.open("a", encoding="utf-8") as f:
+                f.write(line + "\n")
 
     class Handler(BaseHTTPRequestHandler):
         timeout = 10
@@ -217,13 +228,37 @@ def cmd_serve(args: argparse.Namespace) -> int:
         def log_message(self, fmt, *a):  # quiet
             return
 
+        def _cors_headers(self) -> dict[str, str]:
+            if not cors_origin:
+                return {}
+            return {
+                "access-control-allow-origin": cors_origin,
+                "access-control-allow-methods": "GET,POST,OPTIONS",
+                "access-control-allow-headers": "authorization,content-type",
+                "access-control-max-age": "600",
+                "vary": "Origin",
+            }
+
         def _send(self, code: int, payload: dict, headers: dict[str, str] | None = None):
             body = json.dumps(payload).encode("utf-8")
             self.send_response(code)
             self.send_header("content-type", "application/json")
             self.send_header("content-length", str(len(body)))
+            for k, v in self._cors_headers().items():
+                self.send_header(k, v)
             for k, v in (headers or {}).items():
                 self.send_header(k, v)
+            self.end_headers()
+            self.wfile.write(body)
+
+        def do_OPTIONS(self):  # noqa: N802
+            if not cors_origin:
+                return self._send(404, {"error": "not found"})
+            body = b""
+            self.send_response(204)
+            for k, v in self._cors_headers().items():
+                self.send_header(k, v)
+            self.send_header("content-length", "0")
             self.end_headers()
             self.wfile.write(body)
 
@@ -238,24 +273,30 @@ def cmd_serve(args: argparse.Namespace) -> int:
             ip = self.client_address[0] if self.client_address else "unknown"
             ok, retry_after = limiter.allow(ip)
             if not ok:
+                audit({"ip": ip, "path": self.path, "status": 429})
                 return self._send(429, {"error": "rate limit exceeded"}, {"retry-after": str(retry_after)})
             if ingress_token:
                 auth = self.headers.get("authorization", "")
                 if not hmac.compare_digest(auth, f"Bearer {ingress_token}"):
+                    audit({"ip": ip, "path": self.path, "status": 401})
                     return self._send(401, {"error": "unauthorized"})
             try:
                 length = int(self.headers.get("content-length", "0") or 0)
             except ValueError:
+                audit({"ip": ip, "path": self.path, "status": 400, "error": "invalid content-length"})
                 return self._send(400, {"error": "invalid content-length"})
             if length <= 0 or length > max_body:
+                audit({"ip": ip, "path": self.path, "status": 413, "length": length})
                 return self._send(413, {"error": f"content-length must be 1..{max_body}"})
             try:
                 raw = self.rfile.read(length)
                 payload = json.loads(raw.decode("utf-8") or "{}")
             except Exception as exc:  # noqa: BLE001
+                audit({"ip": ip, "path": self.path, "status": 400, "error": "invalid json"})
                 return self._send(400, {"error": f"invalid json: {exc}"})
             text = str(payload.get("text", "")).strip()
             if not text:
+                audit({"ip": ip, "path": self.path, "status": 400, "error": "text required"})
                 return self._send(400, {"error": "text is required"})
             session_id = str(payload.get("session_id", "http:default"))
             # Namespace untrusted HTTP sessions to prevent owner spoofing when no token is configured.
@@ -275,12 +316,16 @@ def cmd_serve(args: argparse.Namespace) -> int:
                     with ingress_lock:
                         rowid = events.insert(ingress_conn, source=msg["source"], external_id=msg["external_id"],
                                               session_id=msg["session_id"], payload=msg["payload"], now=_now())
+                    audit({"ip": ip, "path": self.path, "status": 202, "session_id": session_id, "external_id": msg["external_id"], "inserted": rowid is not None, "durable": True})
                     return self._send(202, {"queued": True, "durable": True, "external_id": msg["external_id"], "inserted": rowid is not None})
                 inbox.put_nowait(msg)
             except queue.Full:
+                audit({"ip": ip, "path": self.path, "status": 503, "error": "queue full"})
                 return self._send(503, {"error": "inbox queue full"})
             except Exception as exc:  # noqa: BLE001
+                audit({"ip": ip, "path": self.path, "status": 503, "error": str(exc)})
                 return self._send(503, {"error": f"ingress unavailable: {exc}"})
+            audit({"ip": ip, "path": self.path, "status": 202, "session_id": session_id, "external_id": msg["external_id"], "durable": False})
             return self._send(202, {"queued": True, "durable": False, "external_id": msg["external_id"]})
 
     httpd = None
@@ -353,6 +398,7 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--token", default="", help="Ingress bearer token (or OPENAGENT_INGRESS_TOKEN)")
     s.add_argument("--max-body", type=int, default=65536, help="Max HTTP request body bytes")
     s.add_argument("--rate-limit", type=int, default=60, help="Max /events requests per IP per minute")
+    s.add_argument("--cors-origin", default="", help="Optional CORS allow-origin for browser clients")
     s.add_argument("--allow-unauthenticated", action="store_true", help="Allow non-loopback HTTP ingress without token (unsafe)")
     s.add_argument("--no-durable-ingress", dest="durable_ingress", action="store_false", help="Queue events in memory before ack (less durable)")
     s.set_defaults(durable_ingress=True)

@@ -75,7 +75,12 @@ class AnthropicProvider:
                 detail = e.read().decode("utf-8", errors="replace")
                 last_err = RuntimeError(f"Anthropic API {e.code}: {detail[:500]}")
                 if e.code in {429, 500, 502, 503, 504} and attempt < 2:
-                    time.sleep(0.05 * (2 ** attempt))
+                    retry_after = e.headers.get("retry-after") if e.headers else None
+                    try:
+                        delay = float(retry_after) if retry_after is not None else 0.05 * (2 ** attempt)
+                    except Exception:
+                        delay = 0.05 * (2 ** attempt)
+                    time.sleep(min(max(delay, 0.0), 5.0))
                     continue
                 raise last_err from e
             except (urllib.error.URLError, TimeoutError, OSError) as e:
