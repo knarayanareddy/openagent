@@ -30,8 +30,10 @@ python -m pytest -q
 # Run the scripted end-to-end demo
 openagent demo
 
-# Run always-on worker with HTTP ingress
+# Run always-on worker with HTTP ingress (local default)
 openagent serve --host 127.0.0.1 --port 8787
+# Authenticated ingress (recommended for any non-loopback exposure)
+OPENAGENT_INGRESS_TOKEN=... openagent serve --host 0.0.0.0 --port 8787
 # or
 python -m openagent demo
 
@@ -59,7 +61,24 @@ openagent ask "Remember that Alex prefers morning meetings."
 openagent ask "Book a catch-up with Alex on Friday" --session work
 ```
 
-### Configuration
+### Serve / HTTP ingress
+
+`openagent serve` runs the always-on worker and (by default) a small HTTP ingress:
+
+- `GET /health` — liveness/config summary.
+- `POST /events` — enqueue an event (`{"text":"...", "session_id":"...", "external_id":"..."}`).
+
+Security defaults / controls:
+
+- **Bind loopback by default.** Non-loopback binds require `--token`/`OPENAGENT_INGRESS_TOKEN` unless `--allow-unauthenticated` is explicitly set (unsafe).
+- **Bearer auth.** When a token is configured, `/events` requires `Authorization: Bearer <token>`.
+- **Durable-before-ack.** HTTP ingress writes events directly to SQLite before returning 202 (disable with `--no-durable-ingress` only if you accept at-most-once in-memory queuing).
+- **Rate limiting.** Per-IP fixed window, default 60 req/min (`--rate-limit`).
+- **Body limits / timeouts.** `--max-body` (default 64KB), content-length validation, socket timeout.
+- **Session namespacing.** Without token auth, untrusted HTTP requests cannot claim the configured owner session id directly.
+- **TLS / reverse proxy.** OpenAgent serve does not terminate TLS. For internet/public exposure, run behind a TLS reverse proxy (nginx/Caddy/Envoy/etc.), keep the app bound to loopback/private interface, forward only required paths, set auth/rate limits at the edge too, and monitor logs/DB.
+
+## Configuration
 
 | Env var | Default | Purpose |
 |---|---|---|

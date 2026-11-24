@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import os
 import urllib.error
+import time
 import urllib.request
 from typing import Any
 
@@ -156,10 +157,23 @@ class OpenAIProvider:
             },
             method="POST",
         )
-        try:
-            with urllib.request.urlopen(req, timeout=self.timeout) as resp:
-                data = json.loads(resp.read().decode("utf-8"))
-        except urllib.error.HTTPError as e:
-            detail = e.read().decode("utf-8", errors="replace")
-            raise RuntimeError(f"OpenAI API {e.code}: {detail[:500]}") from e
-        return _response_from_openai(data)
+        last_err: Exception | None = None
+        for attempt in range(3):
+            try:
+                with urllib.request.urlopen(req, timeout=self.timeout) as resp:
+                    data = json.loads(resp.read().decode("utf-8"))
+                return _response_from_openai(data)
+            except urllib.error.HTTPError as e:
+                detail = e.read().decode("utf-8", errors="replace")
+                last_err = RuntimeError(f"OpenAI API {e.code}: {detail[:500]}")
+                if e.code in {429, 500, 502, 503, 504} and attempt < 2:
+                    time.sleep(0.05 * (2 ** attempt))
+                    continue
+                raise last_err from e
+            except (urllib.error.URLError, TimeoutError, OSError) as e:
+                last_err = RuntimeError(f"OpenAI request failed: {e}")
+                if attempt < 2:
+                    time.sleep(0.05 * (2 ** attempt))
+                    continue
+                raise last_err from e
+        raise last_err or RuntimeError("OpenAI request failed")

@@ -6,10 +6,12 @@ import hmac
 import json
 import os
 import queue
+import sqlite3
 import sys
 import threading
 import time
 import uuid
+from collections import defaultdict, deque
 from datetime import UTC, datetime
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
@@ -145,6 +147,29 @@ def cmd_dream(args: argparse.Namespace) -> int:
 
 
 
+class _RateLimiter:
+    """Simple in-memory fixed-window rate limiter (best-effort, per process)."""
+
+    def __init__(self, limit: int, window_seconds: float = 60.0) -> None:
+        self.limit = max(1, int(limit))
+        self.window = float(window_seconds)
+        self._hits: dict[str, deque[float]] = defaultdict(deque)
+        self._lock = threading.Lock()
+
+    def allow(self, key: str, now: float | None = None) -> tuple[bool, int]:
+        ts = time.monotonic() if now is None else now
+        cutoff = ts - self.window
+        with self._lock:
+            q = self._hits[key]
+            while q and q[0] <= cutoff:
+                q.popleft()
+            if len(q) >= self.limit:
+                retry_after = max(1, int(self.window - (ts - q[0]) + 0.999))
+                return False, retry_after
+            q.append(ts)
+            return True, 0
+
+
 def cmd_serve(args: argparse.Namespace) -> int:
     """Run the always-on worker loop with optional HTTP event ingress."""
     cfg = args.cfg
@@ -170,8 +195,21 @@ def cmd_serve(args: argparse.Namespace) -> int:
 
     ingress_token = (args.token or os.environ.get("OPENAGENT_INGRESS_TOKEN", "")).strip()
     max_body = args.max_body
-    if args.host not in ("127.0.0.1", "localhost", "::1") and not ingress_token:
+    allow_unauth = bool(getattr(args, "allow_unauthenticated", False))
+    durable_ingress = bool(getattr(args, "durable_ingress", True))
+    rate_limit = int(getattr(args, "rate_limit", 60))
+    is_loopback = args.host in ("127.0.0.1", "localhost", "::1")
+    if not is_loopback and not ingress_token and not allow_unauth:
+        print("[openagent] ERROR: refusing non-loopback serve without ingress token. Set --token/OPENAGENT_INGRESS_TOKEN or pass --allow-unauthenticated (unsafe).", flush=True)
+        return 2
+    if not is_loopback and not ingress_token:
         print("[openagent] WARNING: non-loopback serve without OPENAGENT_INGRESS_TOKEN; /events is unauthenticated", flush=True)
+
+    limiter = _RateLimiter(rate_limit)
+    ingress_lock = threading.Lock()
+    ingress_conn = sqlite3.connect(cfg.home / "state.db", check_same_thread=False)
+    ingress_conn.row_factory = sqlite3.Row
+    ingress_conn.execute("PRAGMA busy_timeout=5000")
 
     class Handler(BaseHTTPRequestHandler):
         timeout = 10
@@ -179,11 +217,13 @@ def cmd_serve(args: argparse.Namespace) -> int:
         def log_message(self, fmt, *a):  # quiet
             return
 
-        def _send(self, code: int, payload: dict):
+        def _send(self, code: int, payload: dict, headers: dict[str, str] | None = None):
             body = json.dumps(payload).encode("utf-8")
             self.send_response(code)
             self.send_header("content-type", "application/json")
             self.send_header("content-length", str(len(body)))
+            for k, v in (headers or {}).items():
+                self.send_header(k, v)
             self.end_headers()
             self.wfile.write(body)
 
@@ -195,6 +235,10 @@ def cmd_serve(args: argparse.Namespace) -> int:
         def do_POST(self):  # noqa: N802
             if self.path != "/events":
                 return self._send(404, {"error": "not found"})
+            ip = self.client_address[0] if self.client_address else "unknown"
+            ok, retry_after = limiter.allow(ip)
+            if not ok:
+                return self._send(429, {"error": "rate limit exceeded"}, {"retry-after": str(retry_after)})
             if ingress_token:
                 auth = self.headers.get("authorization", "")
                 if not hmac.compare_digest(auth, f"Bearer {ingress_token}"):
@@ -227,10 +271,17 @@ def cmd_serve(args: argparse.Namespace) -> int:
                 },
             }
             try:
+                if durable_ingress:
+                    with ingress_lock:
+                        rowid = events.insert(ingress_conn, source=msg["source"], external_id=msg["external_id"],
+                                              session_id=msg["session_id"], payload=msg["payload"], now=_now())
+                    return self._send(202, {"queued": True, "durable": True, "external_id": msg["external_id"], "inserted": rowid is not None})
                 inbox.put_nowait(msg)
             except queue.Full:
                 return self._send(503, {"error": "inbox queue full"})
-            return self._send(202, {"queued": True, "external_id": msg["external_id"]})
+            except Exception as exc:  # noqa: BLE001
+                return self._send(503, {"error": f"ingress unavailable: {exc}"})
+            return self._send(202, {"queued": True, "durable": False, "external_id": msg["external_id"]})
 
     httpd = None
     if not args.no_http:
@@ -254,6 +305,10 @@ def cmd_serve(args: argparse.Namespace) -> int:
         clean_shutdown = True
         print("\n[openagent] stopping...", flush=True)
     finally:
+        try:
+            ingress_conn.close()
+        except Exception:
+            pass
         if clean_shutdown:
             worker.stop()  # reset breaker only on clean shutdown
         if httpd is not None:
@@ -297,6 +352,10 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--batch-wait", type=float, default=0.2, help="Batch wait seconds for same-session events")
     s.add_argument("--token", default="", help="Ingress bearer token (or OPENAGENT_INGRESS_TOKEN)")
     s.add_argument("--max-body", type=int, default=65536, help="Max HTTP request body bytes")
+    s.add_argument("--rate-limit", type=int, default=60, help="Max /events requests per IP per minute")
+    s.add_argument("--allow-unauthenticated", action="store_true", help="Allow non-loopback HTTP ingress without token (unsafe)")
+    s.add_argument("--no-durable-ingress", dest="durable_ingress", action="store_false", help="Queue events in memory before ack (less durable)")
+    s.set_defaults(durable_ingress=True)
     s.add_argument("--no-http", action="store_true", help="Disable HTTP ingress")
     s.set_defaults(func=cmd_serve)
 

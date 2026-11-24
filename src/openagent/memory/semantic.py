@@ -62,9 +62,63 @@ class SemanticMemory:
             "SELECT subject, content, source FROM facts ORDER BY id")]
 
     def add_episode(self, happened_at: str, summary: str) -> None:
+        if scan_threat(summary) is not None:
+            return
         self.conn.execute("INSERT INTO episodes (happened_at, summary) VALUES (?, ?)",
                           (happened_at, summary))
         self.conn.commit()
+
+    def all_episodes(self) -> list[dict]:
+        return [dict(r) for r in self.conn.execute(
+            "SELECT happened_at, summary FROM episodes ORDER BY id")]
+
+    def replace_all_episodes(self, episodes: list[dict]) -> None:
+        self.conn.execute("DELETE FROM episodes")
+        for e in episodes:
+            happened_at = str(e.get("happened_at", "")).strip()
+            summary = str(e.get("summary", "")).strip()
+            if happened_at and summary:
+                self.conn.execute("INSERT INTO episodes (happened_at, summary) VALUES (?, ?)",
+                                  (happened_at, summary))
+        self.conn.commit()
+
+    def sync_from_wiki(self, wiki_path: str | Path) -> int:
+        """Rebuild facts table from a wiki/facts.md export. Returns number of facts loaded."""
+        path = Path(wiki_path)
+        if not path.exists():
+            self.replace_all_facts([])
+            ep = path.parent / "episodes.md"
+            if ep.exists():
+                self._sync_episodes_from_wiki(ep)
+            else:
+                self.replace_all_episodes([])
+            return 0
+        subject = ""
+        facts: list[dict] = []
+        for line in path.read_text(encoding="utf-8").splitlines():
+            if line.startswith("## "):
+                subject = line[3:].strip()
+            elif line.startswith("- ") and subject:
+                facts.append({"subject": subject, "content": line[2:].strip(), "source": "wiki"})
+        self.replace_all_facts(facts)
+        ep = path.parent / "episodes.md"
+        if ep.exists():
+            self._sync_episodes_from_wiki(ep)
+        else:
+            # legacy wiki exports did not include episodes; keep existing episodes
+            pass
+        return len(facts)
+
+    def _sync_episodes_from_wiki(self, path: str | Path) -> int:
+        episodes = []
+        for line in Path(path).read_text(encoding="utf-8").splitlines():
+            if line.startswith("- "):
+                # format: - (happened_at) summary
+                m = re.match(r"- \(([^)]+)\)\s+(.*)", line)
+                if m:
+                    episodes.append({"happened_at": m.group(1).strip(), "summary": m.group(2).strip()})
+        self.replace_all_episodes(episodes)
+        return len(episodes)
 
     def search_episodes(self, query: str, k: int = 3) -> list[dict]:
         match = fts_query(query)
@@ -96,18 +150,3 @@ class SemanticMemory:
                                   (subject, content, source))
         self.conn.commit()
 
-    def sync_from_wiki(self, wiki_path: str | Path) -> int:
-        """Rebuild facts table from a wiki/facts.md export. Returns number of facts loaded."""
-        path = Path(wiki_path)
-        if not path.exists():
-            self.replace_all_facts([])
-            return 0
-        subject = ""
-        facts: list[dict] = []
-        for line in path.read_text(encoding="utf-8").splitlines():
-            if line.startswith("## "):
-                subject = line[3:].strip()
-            elif line.startswith("- ") and subject:
-                facts.append({"subject": subject, "content": line[2:].strip(), "source": "wiki"})
-        self.replace_all_facts(facts)
-        return len(facts)
