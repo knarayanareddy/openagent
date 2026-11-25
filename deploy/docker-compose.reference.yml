@@ -1,0 +1,76 @@
+# Reference production-shaped deployment for OpenAgent serve.
+# This is a starting point, not a drop-in secure production system.
+# Fill env/secrets, certs, and external services before use.
+
+services:
+  openagent:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    command: >
+      serve --host 0.0.0.0 --port 8787
+      --token ${OPENAGENT_INGRESS_TOKEN:?set OPENAGENT_INGRESS_TOKEN}
+      --hmac-secret ${OPENAGENT_HMAC_SECRET:-}
+      --allowed-session-prefixes ${OPENAGENT_ALLOWED_SESSION_PREFIXES:-}
+      --allowed-sources ${OPENAGENT_ALLOWED_SOURCES:-}
+      --rate-limit ${OPENAGENT_RATE_LIMIT:-60}
+    environment:
+      OPENAGENT_HOME: /data/openagent
+      OPENAGENT_PROVIDER: ${OPENAGENT_PROVIDER:-scripted}
+      OPENAGENT_MODEL: ${OPENAGENT_MODEL:-}
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+    volumes:
+      - openagent-data:/data/openagent
+    expose:
+      - "8787"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8787/health', timeout=2).read()"]
+      interval: 15s
+      timeout: 3s
+      retries: 5
+    restart: unless-stopped
+
+  caddy:
+    image: caddy:2.8
+    depends_on:
+      openagent:
+        condition: service_healthy
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+      # Mount mTLS certs if used:
+      # - ./certs:/etc/caddy/tls:ro
+    restart: unless-stopped
+
+  # Optional: distributed rate-limit/WAF/policy backends.
+  # OpenAgent currently enforces in-process rate limits; for multi-instance deploys
+  # add edge rate limiting (Caddy/Envoy/nginx plugin, Cloud WAF) or a shared limiter.
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - redis-data:/data
+    expose:
+      - "6379"
+    restart: unless-stopped
+
+  # Optional: ship logs/audit to external immutable storage/SIEM.
+  # Replace with Vector/Fluent Bit/Filebeat configured for your WORM target.
+  audit-shipper:
+    image: busybox:1.36
+    profiles: ["audit-shipping"]
+    command: ["sh", "-c", "echo 'Configure Vector/Fluent Bit to ship /data/openagent/logs/ingress.jsonl to WORM/SIEM'; sleep 3600"]
+    volumes:
+      - openagent-data:/data/openagent:ro
+    restart: "no"
+
+volumes:
+  openagent-data:
+  caddy-data:
+  caddy-config:
+  redis-data:
