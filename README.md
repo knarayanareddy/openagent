@@ -61,7 +61,17 @@ openagent ask "Remember that Alex prefers morning meetings."
 openagent ask "Book a catch-up with Alex on Friday" --session work
 ```
 
-### Serve / HTTP ingress
+### Production hardening / deployment
+
+Repo-solvable baselines are included; some controls require infrastructure.
+
+- `docs/production-hardening.md` — gap-by-gap closure plan and operator checklist.
+- `deploy/` — reference Dockerfile, docker-compose, Caddy/nginx proxy examples, env template.
+- `.github/workflows/ci.yml` — CI tests, adversarial corpus job, docker smoke.
+- `src/openagent/security/` — pluggable `ThreatScanner` and `AuthzPolicy` extension points.
+- `tests/adversarial_corpus/` — seed prompt-injection/adversarial corpus.
+
+## Serve / HTTP ingress
 
 `openagent serve` runs the always-on worker and (by default) a small HTTP ingress:
 

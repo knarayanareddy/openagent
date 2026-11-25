@@ -1,0 +1,59 @@
+# Reference TLS/mTLS reverse proxy for OpenAgent serve.
+# Replace example.com and cert paths. For public TLS, Caddy can obtain certs automatically.
+# For mTLS, set client_auth trust pool to your internal CA.
+
+{
+	# Global options
+	servers {
+		# Optional: tighten timeouts
+		read_timeout 10s
+		write_timeout 30s
+	}
+}
+
+example.com {
+	encode zstd gzip
+
+	# --- TLS termination ---
+	# Caddy automatic HTTPS: replace example.com with a real DNS name.
+	# tls internal  # for local/dev
+
+	# --- mTLS (optional) ---
+	# tls /etc/caddy/tls/server.crt /etc/caddy/tls/server.key {
+	#   client_auth {
+	#     mode require_and_verify
+	#     trust_pool file /etc/caddy/tls/client-ca.pem
+	#   }
+	# }
+
+	# --- Edge rate limiting / WAF ---
+	# Caddy core does not include distributed rate limiting/WAF by default.
+	# Options:
+	# 1) Use Caddy with rate-limit/WAF plugin build (xcaddy).
+	# 2) Put Envoy/nginx/Cloud WAF in front.
+	# 3) Enforce app-level limits (--rate-limit) as baseline only.
+	# Example header hardening:
+	header {
+		Strict-Transport-Security "max-age=31536000; includeSubDomains"
+		X-Content-Type-Options "nosniff"
+		X-Frame-Options "DENY"
+		Referrer-Policy "no-referrer"
+		-Server
+	}
+
+	# Forward only ingress endpoints to OpenAgent.
+	@events path /events /health
+	handle @events {
+		reverse_proxy openagent:8787 {
+			header_up X-Forwarded-For {remote_host}
+			header_up X-Forwarded-Proto {scheme}
+			header_up X-Request-Id {http.request.uuid}
+			# If mTLS validated at edge, forward identity headers from verified cert fields.
+			# header_up X-Client-Subject {http.request.tls.client.subject}
+		}
+	}
+
+	handle {
+		respond "not found" 404
+	}
+}
