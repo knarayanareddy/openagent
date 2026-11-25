@@ -76,8 +76,9 @@ Security defaults / controls:
 - **Rate limiting.** Per-IP fixed window, default 60 req/min (`--rate-limit`), 429 with `Retry-After`.
 - **Body limits / timeouts.** `--max-body` (default 64KB), content-length validation, socket timeout.
 - **Session namespacing.** Without token auth, untrusted HTTP requests cannot claim the configured owner session id directly.
-- **Audit log.** Ingress decisions are appended to `logs/ingress.jsonl` under the OpenAgent home.
-- **CORS.** Optional `--cors-origin` for browser clients; otherwise CORS headers are not emitted.
+- **Audit log.** Ingress decisions are appended to `logs/ingress.jsonl` under the OpenAgent home with a simple hash chain (`prev_hash`/`hash`) for tamper-evidence.
+- **CORS.** Optional comma-separated `--cors-origin` allowlist for browser clients; otherwise CORS headers are not emitted.
+- **HMAC signing.** Optional `--hmac-secret`/`OPENAGENT_HMAC_SECRET` requires `X-OpenAgent-Signature: sha256=<hex>` over the raw request body.
 - **TLS / reverse proxy.** OpenAgent serve does not terminate TLS. For internet/public exposure, run behind a TLS reverse proxy (nginx/Caddy/Envoy/etc.), keep the app bound to loopback/private interface, forward only required paths, set auth/rate limits at the edge too, and monitor logs/DB.
 
 ## Configuration

@@ -183,3 +183,50 @@ def test_serve_http_concurrent_clients(tmp_path: Path):
             p.wait(timeout=5)
         except subprocess.TimeoutExpired:
             p.kill()
+
+
+def test_serve_http_hmac_and_audit_hash_chain(tmp_path: Path):
+    import hashlib, hmac
+    port = _free_port()
+    env = os.environ.copy()
+    env["PYTHONPATH"] = str(Path(__file__).resolve().parents[1] / "src")
+    env["OPENAGENT_HOME"] = str(tmp_path / "home")
+    env["OPENAGENT_PROVIDER"] = "scripted"
+    cmd = [sys.executable, "-m", "openagent", "serve", "--host", "127.0.0.1", "--port", str(port),
+           "--poll", "0.1", "--batch-wait", "0", "--token", "secret", "--hmac-secret", "topsecret"]
+    p = subprocess.Popen(cmd, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    try:
+        _wait_health(f"http://127.0.0.1:{port}/health")
+        body = json.dumps({"text": "hello", "session_id": "s1"}).encode()
+        bad = urllib.request.Request(f"http://127.0.0.1:{port}/events", data=body,
+                                     headers={"content-type": "application/json", "authorization": "Bearer secret", "x-openagent-signature": "sha256=bad"},
+                                     method="POST")
+        try:
+            urllib.request.urlopen(bad, timeout=5)
+            assert False, "expected 401"
+        except urllib.error.HTTPError as e:
+            assert e.code == 401
+        sig = "sha256=" + hmac.new(b"topsecret", body, hashlib.sha256).hexdigest()
+        good = urllib.request.Request(f"http://127.0.0.1:{port}/events", data=body,
+                                      headers={"content-type": "application/json", "authorization": "Bearer secret", "x-openagent-signature": sig},
+                                      method="POST")
+        with urllib.request.urlopen(good, timeout=5) as r:
+            assert r.status == 202
+        audit = tmp_path / "home" / "logs" / "ingress.jsonl"
+        for _ in range(30):
+            if audit.exists() and audit.read_text().strip():
+                break
+            time.sleep(0.1)
+        lines = [json.loads(l) for l in audit.read_text().splitlines() if l.strip()]
+        assert lines and all("hash" in l and "prev_hash" in l for l in lines)
+        # hash chain continuity
+        prev = "0" * 64
+        for l in lines:
+            assert l["prev_hash"] == prev
+            prev = l["hash"]
+    finally:
+        p.terminate()
+        try:
+            p.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            p.kill()

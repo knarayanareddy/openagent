@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import hmac
 import json
 import os
@@ -210,17 +211,39 @@ def cmd_serve(args: argparse.Namespace) -> int:
     ingress_conn = sqlite3.connect(cfg.home / "state.db", check_same_thread=False)
     ingress_conn.row_factory = sqlite3.Row
     ingress_conn.execute("PRAGMA busy_timeout=5000")
-    cors_origin = str(getattr(args, "cors_origin", "") or "").strip()
+    cors_origins = {o.strip() for o in str(getattr(args, "cors_origin", "") or "").split(",") if o.strip()}
+    hmac_secret = str(getattr(args, "hmac_secret", "") or os.environ.get("OPENAGENT_HMAC_SECRET", "")).strip()
     audit_path = cfg.home / "logs" / "ingress.jsonl"
     audit_path.parent.mkdir(parents=True, exist_ok=True)
     audit_lock = threading.Lock()
+    audit_prev_hash = "0" * 64
+    if audit_path.exists():
+        try:
+            last = ""
+            with audit_path.open("rb") as f:
+                f.seek(0, os.SEEK_END)
+                size = f.tell()
+                f.seek(max(0, size - 65536), os.SEEK_SET)
+                tail = f.read().decode("utf-8", errors="ignore").splitlines()
+                for line in reversed(tail):
+                    if line.strip():
+                        last = line
+                        break
+            if last:
+                audit_prev_hash = json.loads(last).get("hash", audit_prev_hash)
+        except Exception:
+            pass
 
     def audit(entry: dict) -> None:
-        entry = {"ts": _now().isoformat(), **entry}
-        line = json.dumps(entry, ensure_ascii=False, default=str)
+        nonlocal audit_prev_hash
+        entry = {"ts": _now().isoformat(), **entry, "prev_hash": audit_prev_hash}
+        base = json.dumps(entry, ensure_ascii=False, sort_keys=True, default=str).encode("utf-8")
+        entry["hash"] = hashlib.sha256(base).hexdigest()
+        line = json.dumps(entry, ensure_ascii=False, sort_keys=True, default=str)
         with audit_lock:
             with audit_path.open("a", encoding="utf-8") as f:
                 f.write(line + "\n")
+            audit_prev_hash = entry["hash"]
 
     class Handler(BaseHTTPRequestHandler):
         timeout = 10
@@ -229,12 +252,13 @@ def cmd_serve(args: argparse.Namespace) -> int:
             return
 
         def _cors_headers(self) -> dict[str, str]:
-            if not cors_origin:
+            origin = self.headers.get("origin", "") if hasattr(self, "headers") else ""
+            if not cors_origins or origin not in cors_origins:
                 return {}
             return {
-                "access-control-allow-origin": cors_origin,
+                "access-control-allow-origin": origin,
                 "access-control-allow-methods": "GET,POST,OPTIONS",
-                "access-control-allow-headers": "authorization,content-type",
+                "access-control-allow-headers": "authorization,content-type,x-openagent-signature",
                 "access-control-max-age": "600",
                 "vary": "Origin",
             }
@@ -252,7 +276,8 @@ def cmd_serve(args: argparse.Namespace) -> int:
             self.wfile.write(body)
 
         def do_OPTIONS(self):  # noqa: N802
-            if not cors_origin:
+            origin = self.headers.get("origin", "")
+            if not cors_origins or origin not in cors_origins:
                 return self._send(404, {"error": "not found"})
             body = b""
             self.send_response(204)
@@ -290,6 +315,16 @@ def cmd_serve(args: argparse.Namespace) -> int:
                 return self._send(413, {"error": f"content-length must be 1..{max_body}"})
             try:
                 raw = self.rfile.read(length)
+            except Exception as exc:  # noqa: BLE001
+                audit({"ip": ip, "path": self.path, "status": 400, "error": "read failed"})
+                return self._send(400, {"error": f"read failed: {exc}"})
+            if hmac_secret:
+                sig = self.headers.get("x-openagent-signature", "")
+                expected = "sha256=" + hmac.new(hmac_secret.encode("utf-8"), raw, hashlib.sha256).hexdigest()
+                if not hmac.compare_digest(sig, expected):
+                    audit({"ip": ip, "path": self.path, "status": 401, "error": "invalid signature"})
+                    return self._send(401, {"error": "invalid signature"})
+            try:
                 payload = json.loads(raw.decode("utf-8") or "{}")
             except Exception as exc:  # noqa: BLE001
                 audit({"ip": ip, "path": self.path, "status": 400, "error": "invalid json"})
@@ -398,7 +433,8 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--token", default="", help="Ingress bearer token (or OPENAGENT_INGRESS_TOKEN)")
     s.add_argument("--max-body", type=int, default=65536, help="Max HTTP request body bytes")
     s.add_argument("--rate-limit", type=int, default=60, help="Max /events requests per IP per minute")
-    s.add_argument("--cors-origin", default="", help="Optional CORS allow-origin for browser clients")
+    s.add_argument("--cors-origin", default="", help="Optional comma-separated CORS allow-origins for browser clients")
+    s.add_argument("--hmac-secret", default="", help="Optional HMAC-SHA256 secret for X-OpenAgent-Signature (or OPENAGENT_HMAC_SECRET)")
     s.add_argument("--allow-unauthenticated", action="store_true", help="Allow non-loopback HTTP ingress without token (unsafe)")
     s.add_argument("--no-durable-ingress", dest="durable_ingress", action="store_false", help="Queue events in memory before ack (less durable)")
     s.set_defaults(durable_ingress=True)
