@@ -11,9 +11,10 @@ from __future__ import annotations
 
 import json
 import re
+from pathlib import Path
 from typing import Any
 
-from openagent.llm import Response
+from openagent.llm import LLM, Response
 
 
 def _text(content: Any) -> str:
@@ -104,3 +105,47 @@ class ScriptedLLM:
         if text.startswith("loop forever"):
             return call("recall", query="anything")
         return say("OK.")
+
+
+class ReplayLLM:
+    """Record/replay LLM responses for deterministic evals of real interactions.
+
+    mode="record": wraps an inner LLM, writes each call+response to JSONL.
+    mode="replay": reads responses from JSONL in order, no inner LLM needed.
+
+    This makes provider behavior reproducible in tests without live API calls.
+    """
+    def __init__(self, path: str | Path, mode: str = "replay", inner: LLM | None = None):
+        self.path = Path(path)
+        self.mode = mode
+        self.inner = inner
+        self._replay: list[dict] | None = None
+        self._index = 0
+        self.calls: list[dict] = []
+
+    def _load(self) -> list[dict]:
+        if self._replay is None:
+            if not self.path.exists():
+                self._replay = []
+            else:
+                self._replay = [json.loads(line) for line in self.path.read_text(encoding="utf-8").splitlines() if line.strip()]
+        return self._replay
+
+    def __call__(self, system: str, messages: list[dict], tools: list[dict], tool_choice: str | None = None, **_: Any) -> Response:
+        record = {"system": system, "messages": messages, "tools": tools, "tool_choice": tool_choice}
+        self.calls.append(record)
+        if self.mode == "replay":
+            rows = self._load()
+            if self._index >= len(rows):
+                raise RuntimeError(f"ReplayLLM exhausted at index {self._index} ({self.path})")
+            row = rows[self._index]
+            self._index += 1
+            return Response(content=row["content"], stop_reason=row.get("stop_reason", "end_turn"), usage=row.get("usage", {"in": 0, "out": 0}))
+        if self.inner is None:
+            raise RuntimeError("ReplayLLM record mode requires inner LLM")
+        resp = self.inner(system, messages, tools, tool_choice=tool_choice)
+        row = {**record, "content": resp.content, "stop_reason": resp.stop_reason, "usage": resp.usage}
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        with self.path.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(row, ensure_ascii=False) + "\n")
+        return resp

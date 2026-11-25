@@ -9,6 +9,8 @@ from __future__ import annotations
 import json
 import os
 import urllib.error
+import time
+from email.utils import parsedate_to_datetime
 import urllib.request
 from typing import Any
 
@@ -141,10 +143,10 @@ class OpenAIProvider:
         }
         if tools:
             payload["tools"] = _tools_to_openai(tools)
-        if tool_choice == "none":
-            payload["tool_choice"] = "none"
-        elif tool_choice == "any":
-            payload["tool_choice"] = "required"
+            if tool_choice == "none":
+                payload["tool_choice"] = "none"
+            elif tool_choice == "any":
+                payload["tool_choice"] = "required"
 
         body = json.dumps(payload).encode("utf-8")
         req = urllib.request.Request(
@@ -156,10 +158,34 @@ class OpenAIProvider:
             },
             method="POST",
         )
-        try:
-            with urllib.request.urlopen(req, timeout=self.timeout) as resp:
-                data = json.loads(resp.read().decode("utf-8"))
-        except urllib.error.HTTPError as e:
-            detail = e.read().decode("utf-8", errors="replace")
-            raise RuntimeError(f"OpenAI API {e.code}: {detail[:500]}") from e
-        return _response_from_openai(data)
+        last_err: Exception | None = None
+        for attempt in range(3):
+            try:
+                with urllib.request.urlopen(req, timeout=self.timeout) as resp:
+                    data = json.loads(resp.read().decode("utf-8"))
+                return _response_from_openai(data)
+            except urllib.error.HTTPError as e:
+                detail = e.read().decode("utf-8", errors="replace")
+                last_err = RuntimeError(f"OpenAI API {e.code}: {detail[:500]}")
+                if e.code in {429, 500, 502, 503, 504} and attempt < 2:
+                    retry_after = e.headers.get("retry-after") if e.headers else None
+                    delay = 0.05 * (2 ** attempt)
+                    if retry_after is not None:
+                        try:
+                            delay = float(retry_after)
+                        except Exception:
+                            try:
+                                dt = parsedate_to_datetime(str(retry_after))
+                                delay = dt.timestamp() - time.time()
+                            except Exception:
+                                pass
+                    time.sleep(min(max(delay, 0.0), 5.0))
+                    continue
+                raise last_err from e
+            except (urllib.error.URLError, TimeoutError, OSError) as e:
+                last_err = RuntimeError(f"OpenAI request failed: {e}")
+                if attempt < 2:
+                    time.sleep(0.05 * (2 ** attempt))
+                    continue
+                raise last_err from e
+        raise last_err or RuntimeError("OpenAI request failed")

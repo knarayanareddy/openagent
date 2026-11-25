@@ -58,11 +58,20 @@ _OPS_STATE = re.compile(
 
 
 def is_ops_state(fact: dict) -> bool:
-    """A fact about the assistant's own state, not about the person."""
+    """A fact about the assistant's own operating state, not about the person.
+
+    Heuristic: only drop when the subject is clearly assistant/system-owned, or the
+    content is obviously assistant runtime state. This avoids dropping user facts that
+    happen to mention words like "balance", "insufficient", or "timed out".
+    """
+    subject = str(fact.get("subject", "")).strip().lower()
     text = f"{fact.get('subject', '')} {fact.get('content', '')}"
+    assistant_subject = subject in {"assistant", "openagent", "system", "model", "agent", "bot"}
     if re.search(r"\bbalance\b", text, re.I) and _MONEYISH.search(text):
-        return True
-    return _OPS_STATE.search(text) is not None
+        return assistant_subject or bool(re.search(r"\b(?:api|credit|token|account balance)\b", text, re.I))
+    if _OPS_STATE.search(text) is not None:
+        return assistant_subject
+    return False
 
 
 def _words(text: str) -> set[str]:
@@ -70,16 +79,28 @@ def _words(text: str) -> set[str]:
     return {w.rstrip(".,:;-") for w in re.findall(r"[^\W_][\w$.:/-]*", text.lower())}
 
 
-def restates(fact: dict, recalled: str) -> bool:
-    """True when the fact only repeats memory the turn read: it has a number or date,
-    and every capitalised or numeric word in it is already in `recalled`.
+_CONTRADICTION = re.compile(
+    r"\b(?:no|not|never|cancel(?:led|ed)?|reschedul\w*|mov\w+|chang\w+|instead|delay\w*|postpon\w*|drop\w*)\b",
+    re.I,
+)
 
-    A fact with no number is never dropped here, however familiar its names, so
-    something new the user says is not lost."""
+
+def restates(fact: dict, recalled: str) -> bool:
+    """True when the fact only repeats memory the turn read.
+
+    Heuristic: if the content contains a number/date-like token and every capitalized
+    or numeric token in it appears in some recalled line, treat as a restatement.
+    Skip contradictions/updates so cancellations and reschedules are not lost.
+    """
     content = str(fact.get("content", "")).replace("\u2019", "'")
+    if _CONTRADICTION.search(content):
+        return False
     key = _words(" ".join(w for w in content.split() if any(c.isupper() or c.isdigit() for c in w)))
-    has_number = any(w[0].isdigit() for w in key)
-    return has_number and key <= _words(recalled)
+    has_number = any(any(c.isdigit() for c in w) for w in key)
+    if not has_number or not recalled.strip():
+        return False
+    recalled_lines = [line for line in recalled.splitlines() if line.strip()]
+    return any(key <= _words(line) for line in recalled_lines)
 
 
 def _norm(text: str) -> str:

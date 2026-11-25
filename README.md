@@ -16,7 +16,7 @@ deterministic tests.
 - **Dream consolidation** — cursor-based distillation with guards (drops ops state, restatements, duplicates), git-auditable memory directory, wiki export.
 - **Always-on primitives** — event inbox with dedupe, outbox with idempotency/backoff/dead-letter, timers (`at/every/daily` + active-hours defer-not-drop), parked approvals, startup circuit breaker.
 - **Provider adapters** — Anthropic Messages API and OpenAI Chat Completions (stdlib urllib, no required SDK). ScriptedLLM for offline/demo mode.
-- **CLI** — `openagent chat`, `openagent ask`, `openagent demo`, `openagent dream`, `openagent info`.
+- **CLI** — `openagent chat`, `openagent ask`, `openagent serve`, `openagent demo`, `openagent dream`, `openagent info`.
 
 ## Quickstart
 
@@ -29,6 +29,11 @@ python -m pytest -q
 
 # Run the scripted end-to-end demo
 openagent demo
+
+# Run always-on worker with HTTP ingress (local default)
+openagent serve --host 127.0.0.1 --port 8787
+# Authenticated ingress (recommended for any non-loopback exposure)
+OPENAGENT_INGRESS_TOKEN=... openagent serve --host 0.0.0.0 --port 8787
 # or
 python -m openagent demo
 
@@ -56,7 +61,27 @@ openagent ask "Remember that Alex prefers morning meetings."
 openagent ask "Book a catch-up with Alex on Friday" --session work
 ```
 
-### Configuration
+### Serve / HTTP ingress
+
+`openagent serve` runs the always-on worker and (by default) a small HTTP ingress:
+
+- `GET /health` — liveness/config summary.
+- `POST /events` — enqueue an event (`{"text":"...", "session_id":"...", "external_id":"..."}`).
+
+Security defaults / controls:
+
+- **Bind loopback by default.** Non-loopback binds require `--token`/`OPENAGENT_INGRESS_TOKEN` unless `--allow-unauthenticated` is explicitly set (unsafe).
+- **Bearer auth.** When a token is configured, `/events` requires `Authorization: Bearer <token>`.
+- **Durable-before-ack.** HTTP ingress writes events directly to SQLite before returning 202 (disable with `--no-durable-ingress` only if you accept at-most-once in-memory queuing).
+- **Rate limiting.** Per-IP fixed window, default 60 req/min (`--rate-limit`), 429 with `Retry-After`.
+- **Body limits / timeouts.** `--max-body` (default 64KB), content-length validation, socket timeout, and `--max-text-length`.
+- **ACL/policy.** Optional `--allowed-session-prefixes` and `--allowed-sources` enforce basic ingress session/source allowlists; untrusted sessions are namespaced when no token is configured.
+- **Audit log.** Ingress decisions are appended to `logs/ingress.jsonl` under the OpenAgent home with a simple hash chain (`prev_hash`/`hash`) for tamper-evidence.
+- **CORS.** Optional comma-separated `--cors-origin` allowlist for browser clients; otherwise CORS headers are not emitted.
+- **HMAC signing.** Optional `--hmac-secret`/`OPENAGENT_HMAC_SECRET` requires `X-OpenAgent-Signature: sha256=<hex>` over the raw request body.
+- **TLS / reverse proxy.** OpenAgent serve does not terminate TLS. For internet/public exposure, run behind a TLS reverse proxy (nginx/Caddy/Envoy/etc.), keep the app bound to loopback/private interface, forward only required paths, set auth/rate limits at the edge too, and monitor logs/DB.
+
+## Configuration
 
 | Env var | Default | Purpose |
 |---|---|---|
@@ -83,16 +108,16 @@ openagent ask "Book a catch-up with Alex on Friday" --session work
 │   ├── llm.py               # Internal LLM dialect
 │   ├── loop.py              # 3-exit agent loop
 │   ├── testing.py           # ScriptedLLM for deterministic evals
+│   ├── senders.py           # Outbound senders (stdout/webhook/Telegram)
 │   ├── tools.py             # Tool registry + built-ins + rules
 │   ├── trace.py             # Observer/trace
 │   ├── alwayson/            # inbox, outbox, approvals, timers, breaker, worker
 │   ├── memory/              # curated, semantic, gate, dream, audit
 │   └── providers/           # Anthropic/OpenAI adapters
-├── tests/                   # Deterministic pytest suite (35 tests)
+├── tests/                   # Deterministic pytest suite (42 tests)
 ├── examples/                # Demo script
 ├── prototypes/reference/    # Reference slices from studied repos (original languages)
 ├── review/                  # Review preview app + built artifact
-├── docs/                    # Design/review notes
 ├── NOTICE.md                # Attribution and provenance
 └── pyproject.toml
 ```
@@ -139,7 +164,7 @@ upstream `hosted/` ELv2 code is included. See [NOTICE.md](NOTICE.md).
 ## Review artifact
 
 The original review/preview package is preserved under `review/`. The built preview is
-`review/waku-fusion-review.html` (static report artifact).
+`review/openagent-review.html` (static report artifact).
 
 ## Development
 

@@ -29,10 +29,11 @@ MAX_ATTEMPTS = 5
 _TELEGRAM = re.compile(r"^telegram:(-?\d+)$")
 _SLACK = re.compile(r"^slack:([A-Z0-9]+)(?::(\d+\.\d+))?$")
 _GITHUB = re.compile(r"^github:([^#\s]+)#([1-9]\d*)$")
+_GENERIC = re.compile(r"^(local|cli|stdout|webhook):(.+)$")
 
 
 def parse_address(text: str) -> tuple[str, dict] | None:
-    """telegram:<chat id> | slack:<channel>[:<thread>] | github:<owner>/<repo>#<number>"""
+    """telegram:<chat id> | slack:<channel>[:<thread>] | github:<owner>/<repo>#<number> | local/cli/stdout/webhook:<id>"""
     text = (text or "").strip()
     if m := _TELEGRAM.match(text):
         return "telegram", {"chat_id": int(m[1])}
@@ -40,6 +41,8 @@ def parse_address(text: str) -> tuple[str, dict] | None:
         return "slack", {"channel": m[1], **({"thread_ts": m[2]} if m[2] else {})}
     if m := _GITHUB.match(text):
         return "github", {"repo": m[1], "number": int(m[2])}
+    if m := _GENERIC.match(text):
+        return m[1], {"chat_id": m[2]}
     return None
 
 

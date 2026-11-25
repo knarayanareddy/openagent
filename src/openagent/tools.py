@@ -72,7 +72,18 @@ class ToolRegistry:
 # ---- the tools ---------------------------------------------------------------
 
 def _remember_preference(args: dict, ctx: Ctx) -> str:
-    result = ctx.curated.add("user", str(args.get("entry", "")))
+    action = str(args.get("action", "add")).lower()
+    target = str(args.get("target", "user")).lower()
+    if target not in ("user", "memory"):
+        return json.dumps({"success": False, "error": "target must be 'user' or 'memory'"})
+    entry = str(args.get("entry", ""))
+    old_text = str(args.get("old_text", ""))
+    if action == "replace":
+        result = ctx.curated.replace(target, old_text, entry)
+    elif action == "remove":
+        result = ctx.curated.remove(target, old_text)
+    else:
+        result = ctx.curated.add(target, entry)
     return json.dumps(result)
 
 
@@ -114,8 +125,9 @@ def default_tools() -> ToolRegistry:
     obj: Callable[[dict, list[str]], dict[str, Any]] = lambda props, req: {  # noqa: E731
         "type": "object", "properties": props, "required": req}
     s = {"type": "string"}
-    registry.add(Tool("remember_preference", "Save a stable fact about the user to their profile.",
-                      obj({"entry": s}, ["entry"]), _remember_preference))
+    registry.add(Tool("remember_preference",
+                      "Save or manage curated memory. action: add|replace|remove (default add). target: user|memory (default user).",
+                      obj({"entry": s, "action": s, "target": s, "old_text": s}, ["entry"]), _remember_preference))
     registry.add(Tool("recall", "Search long-term memory.", obj({"query": s}, ["query"]), _recall))
     registry.add(Tool("book_meeting", "Put a meeting on the calendar.",
                       obj({"with": s, "day": s, "time": s}, ["with", "day", "time"]), _book_meeting))

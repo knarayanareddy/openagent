@@ -67,7 +67,7 @@ def run_loop(llm: LLM, system: str, messages: list[dict], tools: ToolRegistry, c
             return result
 
         tool_results = []
-        for call in uses:
+        for idx, call in enumerate(uses):
             started = time.perf_counter()
             verdict, text = before_tool(call["name"], call["input"]) if before_tool else (ALLOW, "")
             if verdict == ALLOW:
@@ -81,6 +81,12 @@ def run_loop(llm: LLM, system: str, messages: list[dict], tools: ToolRegistry, c
             result.tool_calls.append(event)
             observer("tool", {"title": f"{call['name']} -> {verdict}", **event})
             tool_results.append({"type": "tool_result", "tool_use_id": call["id"], "content": output})
+            if result.parked:
+                # Keep tool_result sequence well-formed for providers that require one result per tool_use.
+                for skipped in uses[idx + 1:]:
+                    tool_results.append({"type": "tool_result", "tool_use_id": skipped["id"],
+                                         "content": "Skipped: a prior tool call in this turn requires approval."})
+                break
         messages.append({"role": "user", "content": tool_results})
 
         if result.parked:                                         # exit 3

@@ -9,8 +9,12 @@ Want vectors? Swap this class for a pgvector store with the same three methods.
 
 from __future__ import annotations
 
+import json
 import re
 import sqlite3
+from pathlib import Path
+
+from openagent.memory.curated import scan as scan_threat
 
 
 def fts_query(text: str) -> str:
@@ -30,6 +34,8 @@ class SemanticMemory:
         self.conn = conn
 
     def add_fact(self, subject: str, content: str, source: str = "user") -> int:
+        if scan_threat(f"{subject} {content}") is not None:
+            return -1
         cur = self.conn.execute("INSERT INTO facts (subject, content, source) VALUES (?, ?, ?)",
                                 (subject, content, source))
         self.conn.commit()
@@ -57,9 +63,74 @@ class SemanticMemory:
             "SELECT subject, content, source FROM facts ORDER BY id")]
 
     def add_episode(self, happened_at: str, summary: str) -> None:
+        if scan_threat(summary) is not None:
+            return
         self.conn.execute("INSERT INTO episodes (happened_at, summary) VALUES (?, ?)",
                           (happened_at, summary))
         self.conn.commit()
+
+    def all_episodes(self) -> list[dict]:
+        return [dict(r) for r in self.conn.execute(
+            "SELECT happened_at, summary FROM episodes ORDER BY id")]
+
+    def replace_all_episodes(self, episodes: list[dict]) -> None:
+        self.conn.execute("DELETE FROM episodes")
+        for e in episodes:
+            happened_at = str(e.get("happened_at", "")).strip()
+            summary = str(e.get("summary", "")).strip()
+            if happened_at and summary:
+                self.conn.execute("INSERT INTO episodes (happened_at, summary) VALUES (?, ?)",
+                                  (happened_at, summary))
+        self.conn.commit()
+
+    def sync_from_wiki(self, wiki_path: str | Path) -> int:
+        """Rebuild facts/episodes from wiki snapshot. Prefers state.json; falls back to markdown."""
+        path = Path(wiki_path)
+        state = path.parent / "state.json"
+        if state.exists():
+            try:
+                data = json.loads(state.read_text(encoding="utf-8"))
+                facts = data.get("facts", []) if isinstance(data, dict) else []
+                episodes = data.get("episodes", []) if isinstance(data, dict) else []
+                self.replace_all_facts([f for f in facts if isinstance(f, dict)])
+                self.replace_all_episodes([e for e in episodes if isinstance(e, dict)])
+                return len([f for f in facts if isinstance(f, dict)])
+            except Exception:
+                pass  # fall back to markdown
+        if not path.exists():
+            self.replace_all_facts([])
+            ep = path.parent / "episodes.md"
+            if ep.exists():
+                self._sync_episodes_from_wiki(ep)
+            else:
+                self.replace_all_episodes([])
+            return 0
+        subject = ""
+        facts: list[dict] = []
+        for line in path.read_text(encoding="utf-8").splitlines():
+            if line.startswith("## "):
+                subject = line[3:].strip()
+            elif line.startswith("- ") and subject:
+                facts.append({"subject": subject, "content": line[2:].strip(), "source": "wiki"})
+        self.replace_all_facts(facts)
+        ep = path.parent / "episodes.md"
+        if ep.exists():
+            self._sync_episodes_from_wiki(ep)
+        else:
+            # Legacy wiki snapshots predate episodes.md; clear to avoid split-brain.
+            self.replace_all_episodes([])
+        return len(facts)
+
+    def _sync_episodes_from_wiki(self, path: str | Path) -> int:
+        episodes = []
+        for line in Path(path).read_text(encoding="utf-8").splitlines():
+            if line.startswith("- "):
+                # format: - (happened_at) summary
+                m = re.match(r"- \(([^)]+)\)\s+(.*)", line)
+                if m:
+                    episodes.append({"happened_at": m.group(1).strip(), "summary": m.group(2).strip()})
+        self.replace_all_episodes(episodes)
+        return len(episodes)
 
     def search_episodes(self, query: str, k: int = 3) -> list[dict]:
         match = fts_query(query)
@@ -74,6 +145,25 @@ class SemanticMemory:
     def recall_text(self, query: str) -> str:
         facts = self.search(query)
         episodes = self.search_episodes(query)
-        lines = [f"- {f['content']}" for f in facts]
-        lines += [f"- ({e['happened_at']}) {e['summary']}" for e in episodes]
+        lines = []
+        for f in facts:
+            if scan_threat(f"{f.get('subject','')} {f.get('content','')}") is None:
+                lines.append(f"- {f['content']}")
+        for e in episodes:
+            if scan_threat(str(e.get("summary", ""))) is None:
+                lines.append(f"- ({e['happened_at']}) {e['summary']}")
         return "\n".join(lines)
+
+
+    def replace_all_facts(self, facts: list[dict]) -> None:
+        """Replace all facts (used by audit revert sync)."""
+        self.conn.execute("DELETE FROM facts")
+        for f in facts:
+            subject = str(f.get("subject", "")).strip()
+            content = str(f.get("content", "")).strip()
+            source = str(f.get("source", "wiki"))
+            if subject and content:
+                self.conn.execute("INSERT INTO facts (subject, content, source) VALUES (?, ?, ?)",
+                                  (subject, content, source))
+        self.conn.commit()
+
