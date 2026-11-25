@@ -48,6 +48,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Docker compose config
+        env:
+          OPENAGENT_INGRESS_TOKEN: ci-placeholder
         run: docker compose -f deploy/docker-compose.reference.yml config
       - name: Build image
         run: docker build -f deploy/Dockerfile -t openagent:ci .
