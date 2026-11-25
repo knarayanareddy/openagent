@@ -213,6 +213,9 @@ def cmd_serve(args: argparse.Namespace) -> int:
     ingress_conn.execute("PRAGMA busy_timeout=5000")
     cors_origins = {o.strip() for o in str(getattr(args, "cors_origin", "") or "").split(",") if o.strip()}
     hmac_secret = str(getattr(args, "hmac_secret", "") or os.environ.get("OPENAGENT_HMAC_SECRET", "")).strip()
+    allowed_session_prefixes = [p.strip() for p in str(getattr(args, "allowed_session_prefixes", "") or "").split(",") if p.strip()]
+    allowed_sources = {p.strip() for p in str(getattr(args, "allowed_sources", "") or "").split(",") if p.strip()}
+    max_text_length = max(1, int(getattr(args, "max_text_length", 10000)))
     audit_path = cfg.home / "logs" / "ingress.jsonl"
     audit_path.parent.mkdir(parents=True, exist_ok=True)
     audit_lock = threading.Lock()
@@ -333,17 +336,30 @@ def cmd_serve(args: argparse.Namespace) -> int:
             if not text:
                 audit({"ip": ip, "path": self.path, "status": 400, "error": "text required"})
                 return self._send(400, {"error": "text is required"})
+            if len(text) > max_text_length:
+                audit({"ip": ip, "path": self.path, "status": 413, "error": "text too long"})
+                return self._send(413, {"error": f"text exceeds max_text_length={max_text_length}"})
             session_id = str(payload.get("session_id", "http:default"))
             # Namespace untrusted HTTP sessions to prevent owner spoofing when no token is configured.
             if not ingress_token and session_id == cfg.owner:
                 session_id = f"http:{session_id}"
+            source = str(payload.get("source", "http"))
+            if allowed_sources and source not in allowed_sources:
+                audit({"ip": ip, "path": self.path, "status": 403, "error": "source not allowed", "source": source})
+                return self._send(403, {"error": "source not allowed"})
+            if allowed_session_prefixes and not any(session_id.startswith(pfx) for pfx in allowed_session_prefixes):
+                audit({"ip": ip, "path": self.path, "status": 403, "error": "session not allowed", "session_id": session_id})
+                return self._send(403, {"error": "session not allowed"})
+            reply_to = payload.get("reply_to")
+            if not isinstance(reply_to, dict):
+                reply_to = {"via": "stdout", "chat_id": session_id}
             msg = {
-                "source": str(payload.get("source", "http")),
+                "source": source,
                 "external_id": str(payload.get("external_id") or f"http-{uuid.uuid4().hex}"),
                 "session_id": session_id,
                 "payload": {
                     "text": text,
-                    "reply_to": payload.get("reply_to") or {"via": "stdout", "chat_id": session_id},
+                    "reply_to": reply_to,
                 },
             }
             try:
@@ -435,6 +451,9 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--rate-limit", type=int, default=60, help="Max /events requests per IP per minute")
     s.add_argument("--cors-origin", default="", help="Optional comma-separated CORS allow-origins for browser clients")
     s.add_argument("--hmac-secret", default="", help="Optional HMAC-SHA256 secret for X-OpenAgent-Signature (or OPENAGENT_HMAC_SECRET)")
+    s.add_argument("--allowed-session-prefixes", default="", help="Comma-separated allowed session_id prefixes (empty allows all)")
+    s.add_argument("--allowed-sources", default="", help="Comma-separated allowed event sources (empty allows all)")
+    s.add_argument("--max-text-length", type=int, default=10000, help="Max accepted event text length")
     s.add_argument("--allow-unauthenticated", action="store_true", help="Allow non-loopback HTTP ingress without token (unsafe)")
     s.add_argument("--no-durable-ingress", dest="durable_ingress", action="store_false", help="Queue events in memory before ack (less durable)")
     s.set_defaults(durable_ingress=True)

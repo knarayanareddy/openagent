@@ -15,6 +15,7 @@ If `git` is not installed every call is a quiet no-op and the agent still works.
 
 from __future__ import annotations
 
+import json
 import subprocess
 from pathlib import Path
 
@@ -62,9 +63,10 @@ class MemoryAudit:
 
 
 def export_wiki(semantic: SemanticMemory, root: Path) -> Path:
-    """Mirror facts and episodes into markdown wiki files per run."""
+    """Mirror facts and episodes into markdown wiki files and JSON snapshot per run."""
     by_subject: dict[str, list[str]] = {}
-    for fact in semantic.all_facts():
+    facts = semantic.all_facts()
+    for fact in facts:
         by_subject.setdefault(fact["subject"], []).append(fact["content"])
     lines = ["# What I know", ""]
     for subject in sorted(by_subject, key=str.lower):
@@ -73,8 +75,11 @@ def export_wiki(semantic: SemanticMemory, root: Path) -> Path:
     wiki.mkdir(parents=True, exist_ok=True)
     path = wiki / "facts.md"
     path.write_text("\n".join(lines), encoding="utf-8")
+    episodes = semantic.all_episodes()
     ep_lines = ["# Episodes", ""]
-    for ep in semantic.all_episodes():
+    for ep in episodes:
         ep_lines.append(f"- ({ep['happened_at']}) {ep['summary']}")
     (wiki / "episodes.md").write_text("\n".join(ep_lines) + "\n", encoding="utf-8")
+    snapshot = {"version": 1, "facts": facts, "episodes": episodes}
+    (wiki / "state.json").write_text(json.dumps(snapshot, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     return path

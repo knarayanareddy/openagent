@@ -74,8 +74,8 @@ Security defaults / controls:
 - **Bearer auth.** When a token is configured, `/events` requires `Authorization: Bearer <token>`.
 - **Durable-before-ack.** HTTP ingress writes events directly to SQLite before returning 202 (disable with `--no-durable-ingress` only if you accept at-most-once in-memory queuing).
 - **Rate limiting.** Per-IP fixed window, default 60 req/min (`--rate-limit`), 429 with `Retry-After`.
-- **Body limits / timeouts.** `--max-body` (default 64KB), content-length validation, socket timeout.
-- **Session namespacing.** Without token auth, untrusted HTTP requests cannot claim the configured owner session id directly.
+- **Body limits / timeouts.** `--max-body` (default 64KB), content-length validation, socket timeout, and `--max-text-length`.
+- **ACL/policy.** Optional `--allowed-session-prefixes` and `--allowed-sources` enforce basic ingress session/source allowlists; untrusted sessions are namespaced when no token is configured.
 - **Audit log.** Ingress decisions are appended to `logs/ingress.jsonl` under the OpenAgent home with a simple hash chain (`prev_hash`/`hash`) for tamper-evidence.
 - **CORS.** Optional comma-separated `--cors-origin` allowlist for browser clients; otherwise CORS headers are not emitted.
 - **HMAC signing.** Optional `--hmac-secret`/`OPENAGENT_HMAC_SECRET` requires `X-OpenAgent-Signature: sha256=<hex>` over the raw request body.

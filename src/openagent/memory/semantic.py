@@ -9,6 +9,7 @@ Want vectors? Swap this class for a pgvector store with the same three methods.
 
 from __future__ import annotations
 
+import json
 import re
 import sqlite3
 from pathlib import Path
@@ -83,8 +84,19 @@ class SemanticMemory:
         self.conn.commit()
 
     def sync_from_wiki(self, wiki_path: str | Path) -> int:
-        """Rebuild facts table from a wiki/facts.md export. Returns number of facts loaded."""
+        """Rebuild facts/episodes from wiki snapshot. Prefers state.json; falls back to markdown."""
         path = Path(wiki_path)
+        state = path.parent / "state.json"
+        if state.exists():
+            try:
+                data = json.loads(state.read_text(encoding="utf-8"))
+                facts = data.get("facts", []) if isinstance(data, dict) else []
+                episodes = data.get("episodes", []) if isinstance(data, dict) else []
+                self.replace_all_facts([f for f in facts if isinstance(f, dict)])
+                self.replace_all_episodes([e for e in episodes if isinstance(e, dict)])
+                return len([f for f in facts if isinstance(f, dict)])
+            except Exception:
+                pass  # fall back to markdown
         if not path.exists():
             self.replace_all_facts([])
             ep = path.parent / "episodes.md"
