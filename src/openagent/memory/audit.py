@@ -16,6 +16,7 @@ If `git` is not installed every call is a quiet no-op and the agent still works.
 from __future__ import annotations
 
 import json
+import re
 import subprocess
 from pathlib import Path
 
@@ -55,11 +56,19 @@ class MemoryAudit:
         return [tuple(line.split("\t", 1)) for line in log.stdout.splitlines()]  # type: ignore[misc]
 
     def revert(self, sha: str, semantic: SemanticMemory | None = None) -> bool:
+        sha = str(sha or "").strip()
+        if not re.fullmatch(r"[0-9a-fA-F]{7,40}", sha):
+            return False
         done = self._git("revert", "--no-edit", sha)
         ok = bool(done and done.returncode == 0)
-        if ok and semantic is not None:
+        if not ok:
+            # Leave repo in a clean state if revert conflicted.
+            self._git("revert", "--abort")
+            self._git("merge", "--abort")
+            return False
+        if semantic is not None:
             semantic.sync_from_wiki(self.root / "wiki" / "facts.md")
-        return ok
+        return True
 
 
 def export_wiki(semantic: SemanticMemory, root: Path) -> Path:

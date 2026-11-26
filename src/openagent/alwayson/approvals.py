@@ -32,12 +32,12 @@ from openagent.tools import Ctx, ToolRegistry
 from openagent.trace import silent
 
 TTL = timedelta(hours=72)
-_YES = re.compile(r"^\s*(?:yes|y|approve|approved|ok|go ahead)\W*$", re.I)
-_NO = re.compile(r"^\s*(?:no|n|deny|reject|cancel|stop)\W*$", re.I)
+_YES = re.compile(r"^\s*(?:yes|y|approve|approved|ok(?:ay)?|go ahead)\b", re.I)
+_NO = re.compile(r"^\s*(?:no|n|deny|denied|reject|rejected|cancel|cancelled|stop)\b", re.I)
 
 
 def park(conn: sqlite3.Connection, *, approver: str, origin_session: str, origin_address: str,
-         tool: str, args: dict, now: datetime) -> str | None:
+         tool: str, args: dict, now: datetime, resume_state: dict | None = None) -> str | None:
     """Store the call and return its hash, or None when this approver already has one waiting."""
     pending = conn.execute("SELECT expires_at FROM parked WHERE approver_session = ?", (approver,)).fetchone()
     if pending and parse_stamp(pending["expires_at"]) > now:
@@ -45,9 +45,9 @@ def park(conn: sqlite3.Connection, *, approver: str, origin_session: str, origin
     digest = call_hash(tool, args)
     conn.execute(
         "INSERT OR REPLACE INTO parked (approver_session, origin_session, origin_address, tool, args, "
-        "args_sha256, requested_at, expires_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        "args_sha256, requested_at, expires_at, resume_state) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
         (approver, origin_session, origin_address, tool, json.dumps(args, ensure_ascii=False), digest,
-         stamp(now), stamp(now + TTL)))
+         stamp(now), stamp(now + TTL), json.dumps(resume_state or {}, ensure_ascii=False)))
     conn.commit()
     return digest
 
@@ -57,12 +57,28 @@ def question(tool: str, args: dict) -> str:
     return f"OpenAgent wants to run {tool}({shown}). Reply yes or no. It waits 72 hours."
 
 
+def _load_resume_state(row: sqlite3.Row) -> dict | None:
+    raw = ""
+    try:
+        raw = row["resume_state"]
+    except Exception:
+        raw = ""
+    if not raw:
+        return None
+    try:
+        data = json.loads(raw)
+        return data if isinstance(data, dict) and data.get("version") == 1 else None
+    except Exception:
+        return None
+
+
 def answer(conn: sqlite3.Connection, *, session_id: str, text: str, now: datetime, guard: Guard,
-           tools: ToolRegistry, ctx: Ctx, observer=silent) -> str | None:
+           tools: ToolRegistry, ctx: Ctx, observer=silent, llm=None, before_tool=None, on_hold=None) -> str | None:
     """Handle yes/no from an approver. Returns None when the text is an ordinary message."""
     row = conn.execute("SELECT * FROM parked WHERE approver_session = ?", (session_id,)).fetchone()
     if row is None or not (_YES.match(text) or _NO.match(text)):
         return None
+    resume_state = _load_resume_state(row)
     conn.execute("DELETE FROM parked WHERE approver_session = ?", (session_id,))
     conn.commit()
     if parse_stamp(row["expires_at"]) <= now:
@@ -82,6 +98,34 @@ def answer(conn: sqlite3.Connection, *, session_id: str, text: str, now: datetim
                 outcome = f"The owner approved {row['tool']}. Result: {result}"
                 observer("approval", {"title": f"{row['tool']} approved and run exactly as stored",
                                       "sha256": row["args_sha256"][:12], "result": result})
+                # Durable resume: continue the parked turn when state is available.
+                if llm is not None and resume_state:
+                    try:
+                        from openagent.loop import run_loop
+                        resume_messages = list(resume_state.get("messages") or [])
+                        held_call = dict(resume_state.get("held_call") or {})
+                        held_id = held_call.get("id")
+                        # Replace the held tool_result content with actual result
+                        for msg in reversed(resume_messages):
+                            if msg.get("role") == "user" and isinstance(msg.get("content"), list):
+                                for block in msg["content"]:
+                                    if block.get("type") == "tool_result" and (held_id is None or block.get("tool_use_id") == held_id):
+                                        block["content"] = result
+                                        held_id = None
+                                        break
+                            if held_id is None:
+                                break
+                        system = str(resume_state.get("system") or "")
+                        max_iterations = int(resume_state.get("max_iterations") or 10)
+                        resumed = run_loop(llm, system, resume_messages, tools, ctx, before_tool=before_tool,
+                                           max_iterations=max_iterations, on_hold=on_hold, observer=observer)
+                        if resumed.reply:
+                            outcome = resumed.reply
+                        elif resumed.parked:
+                            outcome = "(awaiting another approval)"
+                    except Exception as exc:  # noqa: BLE001
+                        observer("approval", {"title": "resume failed", "error": str(exc)})
+                        outcome = f"The owner approved {row['tool']}. Result: {result}"
             else:
                 outcome = f"{row['tool']} was not run: {decision.reason}."
                 observer("approval", {"title": f"replay refused by the guard ({decision.verdict})",
@@ -96,3 +140,10 @@ def answer(conn: sqlite3.Connection, *, session_id: str, text: str, now: datetim
 def outbox_target(address: str) -> dict:
     parsed = outbox.parse_address(address)
     return {"via": parsed[0], **parsed[1]} if parsed else {}
+
+
+def set_resume_state(conn: sqlite3.Connection, approver: str, args_sha256: str, resume_state: dict) -> None:
+    conn.execute(
+        "UPDATE parked SET resume_state = ? WHERE approver_session = ? AND args_sha256 = ?",
+        (json.dumps(resume_state, ensure_ascii=False), approver, args_sha256))
+    conn.commit()

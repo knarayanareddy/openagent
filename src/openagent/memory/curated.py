@@ -80,12 +80,38 @@ _THREATS: list[tuple[re.Pattern[str], str]] = [
 ]
 
 
-def scan(content: str) -> str | None:
-    """Why this text may not enter memory, or None when it is clean."""
+# Optional pluggable scanner hook: Callable[[str, dict|None], str|None]
+# Returning a reason string rejects content; None accepts. Set by security wiring.
+_EXTRA_THREAT_SCANNER = None
+
+
+def set_extra_threat_scanner(scanner) -> None:
+    global _EXTRA_THREAT_SCANNER
+    _EXTRA_THREAT_SCANNER = scanner
+
+
+def _regex_scan(content: str) -> str | None:
     normalized = unicodedata.normalize("NFKC", content)
     for pattern, reason in _THREATS:
         if pattern.search(content) or pattern.search(normalized):
             return reason
+    return None
+
+
+def scan(content: str) -> str | None:
+    """Why this text may not enter memory, or None when it is clean."""
+    reason = _regex_scan(content)
+    if reason is not None:
+        return reason
+    extra = _EXTRA_THREAT_SCANNER
+    if extra is not None:
+        try:
+            extra_reason = extra(content, None)
+            if extra_reason:
+                return str(extra_reason)
+        except Exception:
+            # fail closed for scanner errors on memory write paths
+            return "threat scanner error"
     return None
 
 
@@ -152,7 +178,12 @@ class CuratedMemory:
         return {"success": True, "usage": self.usage(target)}
 
     def replace(self, target: str, old_text: str, content: str) -> dict:
+        old_text = " ".join(str(old_text).split())
         content = " ".join(content.split())
+        if not old_text:
+            return {"success": False, "error": "old_text is required for replace"}
+        if not content:
+            return {"success": False, "error": "entry is required for replace"}
         if (reason := scan(content)) is not None:
             return {"success": False, "refused": True, "error": f"Refused: {reason}."}
         entries = self.entries(target)
@@ -166,9 +197,13 @@ class CuratedMemory:
         return {"success": True, "usage": self.usage(target)}
 
     def remove(self, target: str, old_text: str) -> dict:
+        old_text = " ".join(str(old_text).split())
+        if not old_text:
+            return {"success": False, "error": "old_text is required for remove"}
         entries = self.entries(target)
-        kept = [e for e in entries if old_text not in e]
-        if len(kept) == len(entries):
-            return {"success": False, "error": f"no entry contains {old_text!r}"}
+        hits = [i for i, e in enumerate(entries) if old_text in e]
+        if len(hits) != 1:
+            return {"success": False, "error": f"{old_text!r} matched {len(hits)} entries; need exactly 1"}
+        kept = [*entries[:hits[0]], *entries[hits[0] + 1:]]
         self._write(target, kept)
         return {"success": True, "usage": self.usage(target)}

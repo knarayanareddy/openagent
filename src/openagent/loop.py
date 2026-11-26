@@ -50,6 +50,7 @@ class LoopResult:
 
 def run_loop(llm: LLM, system: str, messages: list[dict], tools: ToolRegistry, ctx: Ctx, *,
              before_tool: BeforeTool | None = None, max_iterations: int = 10,
+             on_hold: Callable[[dict, list[dict], list[dict]], None] | None = None,
              observer=silent) -> LoopResult:
     """Run one agent turn. `messages` is mutated in place: afterwards it holds the
     turn's whole working memory (thoughts, tool calls, tool results)."""
@@ -90,6 +91,10 @@ def run_loop(llm: LLM, system: str, messages: list[dict], tools: ToolRegistry, c
         messages.append({"role": "user", "content": tool_results})
 
         if result.parked:                                         # exit 3
+            if on_hold is not None:
+                # held_call is the call that triggered HOLD; remaining uses were skipped
+                held_call = next((c for c, r in zip(uses, result.tool_calls[-len(uses):]) if r.get("verdict") == HOLD), uses[-1])
+                on_hold(held_call, messages, uses)
             return result
 
     result.limit_reached = True                                   # exit 2

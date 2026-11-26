@@ -14,12 +14,12 @@ import time
 import uuid
 from collections import defaultdict, deque
 from datetime import UTC, datetime
-from http.server import BaseHTTPRequestHandler, HTTPServer
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 from openagent import __version__
 from openagent.agent import Fusion
-from openagent.alwayson import events
+from openagent.alwayson import approvals, events, outbox
 from openagent.alwayson.worker import Worker
 from openagent.config import Config
 from openagent.senders import build_senders
@@ -78,7 +78,51 @@ def cmd_ask(args: argparse.Namespace) -> int:
     agent = build_agent(cfg)
     session = args.session
     reply_to = {"via": "cli", "chat_id": cfg.owner}
-    turn = agent.respond(session, args.text, reply_to, _now())
+    text = args.text
+    # Allow owner to answer parked approvals from CLI.
+    parked = agent.conn.execute("SELECT 1 FROM parked WHERE approver_session = ?", (cfg.owner,)).fetchone()
+    if parked and (approvals._YES.match(text) or approvals._NO.match(text)):
+        ctx = agent.ctx(cfg.owner, reply_to, _now(), "cli-approval")
+        held_digest_resume = None
+        resume_system = ""
+        parked_row = agent.conn.execute("SELECT resume_state FROM parked WHERE approver_session = ?", (cfg.owner,)).fetchone()
+        if parked_row:
+            try:
+                rs = json.loads(parked_row["resume_state"] or "{}")
+                if isinstance(rs, dict):
+                    resume_system = str(rs.get("system") or "")
+            except Exception:
+                pass
+        def _resume_before_tool(name: str, args_: dict):
+            nonlocal held_digest_resume
+            decision = agent.guard.decide(name, args_, ctx)
+            if decision.verdict == "deny":
+                return "deny", f"Refused by the guard: {decision.reason}"
+            if decision.verdict == "hold":
+                target = outbox.parse_address(agent.owner)
+                if target is None:
+                    return "deny", f"Owner address {agent.owner!r} is not a routable address; cannot request approval."
+                digest = approvals.park(agent.conn, approver=agent.owner, origin_session=session, origin_address=outbox.format_address(reply_to["via"], reply_to), tool=name, args=args_, now=_now())
+                if digest is None:
+                    return "deny", "Another call is already waiting for the owner's yes. Try later."
+                held_digest_resume = digest
+                outbox.insert(agent.conn, run_id="cli-approval", channel=target[0], target=target[1], body=approvals.question(name, args_), idempotency_key=f"approval:{digest}", now=_now())
+                return "hold", "This call needs the owner's approval and has been asked. Do not say it was done. It runs only after a yes."
+            return "allow", ""
+        def _resume_on_hold(held_call, held_messages, batch_uses):
+            if held_digest_resume is None:
+                return
+            approvals.set_resume_state(agent.conn, agent.owner, held_digest_resume, {"version":1,"session_id":session,"reply_to":reply_to,"system":resume_system,"messages":held_messages,"held_call":held_call,"batch_uses":batch_uses,"max_iterations":agent.max_iterations})
+        outcome = approvals.answer(agent.conn, session_id=cfg.owner, text=text, now=_now(),
+                                   guard=agent.guard, tools=agent.tools, ctx=ctx, observer=agent.observer,
+                                   llm=agent.llm, before_tool=_resume_before_tool, on_hold=_resume_on_hold)
+        if outcome is not None:
+            if args.json:
+                print(json.dumps({"reply": outcome, "parked": False, "approval": True}, ensure_ascii=False))
+            else:
+                print(outcome)
+            return 0
+    turn = agent.respond(session, text, reply_to, _now())
     if args.json:
         print(json.dumps({
             "reply": turn.reply,
@@ -121,6 +165,45 @@ def cmd_chat(args: argparse.Namespace) -> int:
             result = agent.run_dream(_now(), force=True)
             print(f"[dream] ran={result.ran} kept={len(result.kept)} dropped={len(result.dropped)} commit={result.commit} error={result.error}\n")
             continue
+        parked = agent.conn.execute("SELECT 1 FROM parked WHERE approver_session = ?", (cfg.owner,)).fetchone()
+        if parked and (approvals._YES.match(text) or approvals._NO.match(text)):
+            ctx = agent.ctx(cfg.owner, reply_to, _now(), "cli-approval")
+            held_digest_resume = None
+            resume_system = ""
+            parked_row = agent.conn.execute("SELECT resume_state FROM parked WHERE approver_session = ?", (cfg.owner,)).fetchone()
+            if parked_row:
+                try:
+                    rs = json.loads(parked_row["resume_state"] or "{}")
+                    if isinstance(rs, dict):
+                        resume_system = str(rs.get("system") or "")
+                except Exception:
+                    pass
+            def _resume_before_tool(name: str, args_: dict):
+                nonlocal held_digest_resume
+                decision = agent.guard.decide(name, args_, ctx)
+                if decision.verdict == "deny":
+                    return "deny", f"Refused by the guard: {decision.reason}"
+                if decision.verdict == "hold":
+                    target = outbox.parse_address(agent.owner)
+                    if target is None:
+                        return "deny", f"Owner address {agent.owner!r} is not a routable address; cannot request approval."
+                    digest = approvals.park(agent.conn, approver=agent.owner, origin_session=session, origin_address=outbox.format_address(reply_to["via"], reply_to), tool=name, args=args_, now=_now())
+                    if digest is None:
+                        return "deny", "Another call is already waiting for the owner's yes. Try later."
+                    held_digest_resume = digest
+                    outbox.insert(agent.conn, run_id="cli-approval", channel=target[0], target=target[1], body=approvals.question(name, args_), idempotency_key=f"approval:{digest}", now=_now())
+                    return "hold", "This call needs the owner's approval and has been asked. Do not say it was done. It runs only after a yes."
+                return "allow", ""
+            def _resume_on_hold(held_call, held_messages, batch_uses):
+                if held_digest_resume is None:
+                    return
+                approvals.set_resume_state(agent.conn, agent.owner, held_digest_resume, {"version":1,"session_id":session,"reply_to":reply_to,"system":resume_system,"messages":held_messages,"held_call":held_call,"batch_uses":batch_uses,"max_iterations":agent.max_iterations})
+            outcome = approvals.answer(agent.conn, session_id=cfg.owner, text=text, now=_now(),
+                                       guard=agent.guard, tools=agent.tools, ctx=ctx, observer=agent.observer,
+                                       llm=agent.llm, before_tool=_resume_before_tool, on_hold=_resume_on_hold)
+            if outcome is not None:
+                print(f"agent> {outcome}\n")
+                continue
         turn = agent.respond(session, text, reply_to, _now())
         if turn.loop.parked:
             print("agent> [parked awaiting approval]\n")
@@ -161,9 +244,17 @@ class _RateLimiter:
         ts = time.monotonic() if now is None else now
         cutoff = ts - self.window
         with self._lock:
+            # prune stale keys to avoid unbounded growth
+            if len(self._hits) > 1024:
+                stale = [k for k, q in self._hits.items() if not q or q[-1] <= cutoff]
+                for k in stale:
+                    self._hits.pop(k, None)
             q = self._hits[key]
             while q and q[0] <= cutoff:
                 q.popleft()
+            if not q and key in self._hits and len(self._hits) > 4096:
+                self._hits.pop(key, None)
+                q = self._hits[key]
             if len(q) >= self.limit:
                 retry_after = max(1, int(self.window - (ts - q[0]) + 0.999))
                 return False, retry_after
@@ -213,6 +304,7 @@ def cmd_serve(args: argparse.Namespace) -> int:
     ingress_conn.execute("PRAGMA busy_timeout=5000")
     cors_origins = {o.strip() for o in str(getattr(args, "cors_origin", "") or "").split(",") if o.strip()}
     hmac_secret = str(getattr(args, "hmac_secret", "") or os.environ.get("OPENAGENT_HMAC_SECRET", "")).strip()
+    trusted_proxies = {p.strip() for p in str(getattr(args, "trusted_proxies", "") or os.environ.get("OPENAGENT_TRUSTED_PROXIES", "")).split(",") if p.strip()}
     allowed_session_prefixes = [p.strip() for p in str(getattr(args, "allowed_session_prefixes", "") or "").split(",") if p.strip()]
     allowed_sources = {p.strip() for p in str(getattr(args, "allowed_sources", "") or "").split(",") if p.strip()}
     max_text_length = max(1, int(getattr(args, "max_text_length", 10000)))
@@ -239,14 +331,14 @@ def cmd_serve(args: argparse.Namespace) -> int:
 
     def audit(entry: dict) -> None:
         nonlocal audit_prev_hash
-        entry = {"ts": _now().isoformat(), **entry, "prev_hash": audit_prev_hash}
-        base = json.dumps(entry, ensure_ascii=False, sort_keys=True, default=str).encode("utf-8")
-        entry["hash"] = hashlib.sha256(base).hexdigest()
-        line = json.dumps(entry, ensure_ascii=False, sort_keys=True, default=str)
         with audit_lock:
+            rec = {"ts": _now().isoformat(), **entry, "prev_hash": audit_prev_hash}
+            base = json.dumps(rec, ensure_ascii=False, sort_keys=True, default=str).encode("utf-8")
+            rec["hash"] = hashlib.sha256(base).hexdigest()
+            line = json.dumps(rec, ensure_ascii=False, sort_keys=True, default=str)
             with audit_path.open("a", encoding="utf-8") as f:
                 f.write(line + "\n")
-            audit_prev_hash = entry["hash"]
+            audit_prev_hash = rec["hash"]
 
     class Handler(BaseHTTPRequestHandler):
         timeout = 10
@@ -295,10 +387,21 @@ def cmd_serve(args: argparse.Namespace) -> int:
                 return self._send(200, {"ok": True, "provider": cfg.provider, "model": cfg.model})
             return self._send(404, {"error": "not found"})
 
+        def _client_ip(self) -> str:
+            peer = self.client_address[0] if self.client_address else "unknown"
+            if trusted_proxies and peer in trusted_proxies:
+                xff = self.headers.get("x-forwarded-for", "")
+                if xff:
+                    # left-most is original client when proxies append correctly
+                    candidate = xff.split(",")[0].strip()
+                    if candidate:
+                        return candidate
+            return peer
+
         def do_POST(self):  # noqa: N802
             if self.path != "/events":
                 return self._send(404, {"error": "not found"})
-            ip = self.client_address[0] if self.client_address else "unknown"
+            ip = self._client_ip()
             ok, retry_after = limiter.allow(ip)
             if not ok:
                 audit({"ip": ip, "path": self.path, "status": 429})
@@ -353,6 +456,20 @@ def cmd_serve(args: argparse.Namespace) -> int:
             reply_to = payload.get("reply_to")
             if not isinstance(reply_to, dict):
                 reply_to = {"via": "stdout", "chat_id": session_id}
+            else:
+                via = str(reply_to.get("via", "")).strip()
+                cleaned: dict[str, object] = {"via": via}
+                for k in ("chat_id", "channel", "thread_ts", "repo", "number", "id"):
+                    if k in reply_to:
+                        v = reply_to[k]
+                        if isinstance(v, (str, int)):
+                            cleaned[k] = v
+                parsed_rt = outbox.parse_address(outbox.format_address(via, {k: v for k, v in cleaned.items() if k != "via"}))
+                allowed_vias = {"stdout", "local", "cli"}
+                if not via or parsed_rt is None or via not in allowed_vias:
+                    audit({"ip": ip, "path": self.path, "status": 400, "error": "invalid reply_to"})
+                    return self._send(400, {"error": "reply_to.via must be one of stdout|local|cli and form a valid address"})
+                reply_to = {"via": parsed_rt[0], **parsed_rt[1]}
             msg = {
                 "source": source,
                 "external_id": str(payload.get("external_id") or f"http-{uuid.uuid4().hex}"),
@@ -381,7 +498,7 @@ def cmd_serve(args: argparse.Namespace) -> int:
 
     httpd = None
     if not args.no_http:
-        httpd = HTTPServer((args.host, args.port), Handler)
+        httpd = ThreadingHTTPServer((args.host, args.port), Handler)
         t = threading.Thread(target=httpd.serve_forever, daemon=True)
         t.start()
         print(f"[openagent] http ingress on http://{args.host}:{args.port}  POST /events  GET /health", flush=True)
@@ -451,6 +568,7 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--rate-limit", type=int, default=60, help="Max /events requests per IP per minute")
     s.add_argument("--cors-origin", default="", help="Optional comma-separated CORS allow-origins for browser clients")
     s.add_argument("--hmac-secret", default="", help="Optional HMAC-SHA256 secret for X-OpenAgent-Signature (or OPENAGENT_HMAC_SECRET)")
+    s.add_argument("--trusted-proxies", default="", help="Comma-separated trusted proxy IPs; X-Forwarded-For is honored only from these peers")
     s.add_argument("--allowed-session-prefixes", default="", help="Comma-separated allowed session_id prefixes (empty allows all)")
     s.add_argument("--allowed-sources", default="", help="Comma-separated allowed event sources (empty allows all)")
     s.add_argument("--max-text-length", type=int, default=10000, help="Max accepted event text length")

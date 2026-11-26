@@ -144,6 +144,12 @@ def parse_stamp(text: str) -> datetime:
     return datetime.fromisoformat(text).astimezone(UTC)
 
 
+def _ensure_column(conn: sqlite3.Connection, table: str, column: str, decl: str) -> None:
+    cols = {r["name"] for r in conn.execute(f"PRAGMA table_info({table})").fetchall()}
+    if column not in cols:
+        conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {decl}")
+
+
 def connect(home: Path) -> sqlite3.Connection:
     home.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(home / "state.db")
@@ -151,6 +157,8 @@ def connect(home: Path) -> sqlite3.Connection:
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA busy_timeout=5000")
     conn.executescript(SCHEMA)
+    # lightweight migrations for parked turn resume state
+    _ensure_column(conn, "parked", "resume_state", "TEXT NOT NULL DEFAULT ''")
     conn.commit()
     return conn
 
