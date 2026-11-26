@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import json
 import uuid
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -31,6 +32,8 @@ from openagent.memory.semantic import SemanticMemory
 from openagent.tools import Ctx, ToolRegistry, default_rules, default_tools
 from openagent.security import wire_default_scanner
 from openagent.trace import silent
+
+QUIET = "[quiet]"      # a reply of exactly this is never delivered (persistent-agent pattern)
 
 SOUL = ("You are OpenAgent, a personal assistant that lives on the owner's machine. "
         "Be brief. Use memory only when it helps. Never claim an action happened unless a tool said so.")
@@ -61,6 +64,10 @@ class Fusion:
         self.guard = guard or Guard(default_rules())
         self._snapshots: dict[str, str] = {}
         self._recalled: list[str] = []
+        # --- extension seams (see openagent/persistent/install.py) ---------------------------
+        self.memory_visible: Callable[[str], bool] = lambda session_id: True
+        self.pre_run_hooks: list[Callable[..., str | None]] = []
+        self.system_hooks: list[Callable[..., str]] = []
         wire_default_scanner()
 
     # ------------------------------------------------------------------------
@@ -74,9 +81,14 @@ class Fusion:
 
     def respond(self, session_id: str, text: str, reply_to: dict, now: datetime) -> Turn:
         run_id = uuid.uuid4().hex[:12]
+        for hook in self.pre_run_hooks:                 # a hook may answer without the model
+            shortcut = hook(self, session_id, text, reply_to, now)
+            if shortcut is not None:
+                self.observer("reply", {"title": "answered without a model call", "reply": shortcut})
+                return Turn(shortcut, LoopResult(reply=shortcut))
         # 1. SNAPSHOT: frozen for the session, so the prompt prefix stays cacheable
         if session_id not in self._snapshots:
-            self._snapshots[session_id] = self.curated.snapshot()
+            self._snapshots[session_id] = self.curated.snapshot() if self.memory_visible(session_id) else ""
             self.observer("snapshot", {"title": "curated memory frozen for this session",
                                        "memory": self._snapshots[session_id] or "(empty)"})
         # 2-3. GATE then RECALL
@@ -84,7 +96,7 @@ class Fusion:
         retrieve, query, reason = should_retrieve(self.small_llm, text)
         self.observer("gate", {"title": f"gate: {'retrieve' if retrieve else 'skip memory'}",
                                "reason": reason, "query": query if retrieve else ""})
-        if retrieve:
+        if retrieve and self.memory_visible(session_id):
             recalled = self.semantic.recall_text(query)
             self.observer("recall", {"title": f"recalled {len(recalled.splitlines())} item(s)",
                                      "text": recalled or "(nothing found)"})
@@ -101,6 +113,11 @@ class Fusion:
             system += f"{memory_note}\n<memory_context source=\"curated\">\n{_safe_memory(self._snapshots[session_id])}\n</memory_context>"
         if recalled:
             system += f"{memory_note if not self._snapshots[session_id] else ''}\n<memory_context source=\"recalled\">\n{_safe_memory(recalled)}\n</memory_context>"
+
+        for hook in self.system_hooks:
+            extra = hook(self, session_id, text, now)
+            if extra:
+                system += "\n\n" + extra
 
         # 4. LOOP, with every tool call through the guard
         ctx = self.ctx(session_id, reply_to, now, run_id)
@@ -155,9 +172,11 @@ class Fusion:
                         max_iterations=self.max_iterations, on_hold=on_hold, observer=self.observer)
 
         # 5. SAVE (a parked run says nothing, so only the user's side is logged)
-        self.conn.execute("INSERT INTO chat_log (session_id, role, content) VALUES (?, 'user', ?)",
-                          (session_id, text))
-        if loop.reply:
+        quiet = loop.reply.strip() == QUIET
+        if not quiet:
+            self.conn.execute("INSERT INTO chat_log (session_id, role, content) VALUES (?, 'user', ?)",
+                              (session_id, text))
+        if loop.reply and not quiet:
             self.conn.execute("INSERT INTO chat_log (session_id, role, content) VALUES (?, 'assistant', ?)",
                               (session_id, loop.reply))
         elif loop.parked:

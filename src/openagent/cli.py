@@ -56,8 +56,16 @@ def build_small_llm(cfg: Config):
 def build_agent(cfg: Config, observer=None) -> Fusion:
     llm = build_llm(cfg)
     small = build_small_llm(cfg)
-    return Fusion(cfg.home, llm, small, owner=cfg.owner, observer=observer or (lambda k, e=None: None),
-                  max_iterations=cfg.max_iterations)
+    fusion = Fusion(cfg.home, llm, small, owner=cfg.owner, observer=observer or (lambda k, e=None: None),
+                    max_iterations=cfg.max_iterations)
+    if os.environ.get("OPENAGENT_PERSISTENT", "1") != "0":      # goals, heartbeat, playbooks, scoping
+        from openagent.persistent.install import install
+        from openagent.persistent.mcp import McpBridge
+        url = os.environ.get("OPENAGENT_MCP_URL", "")
+        allow_private = os.environ.get("OPENAGENT_MCP_ALLOW_PRIVATE", "").strip() == "1"
+        allowed_hosts = {h.strip().lower() for h in os.environ.get("OPENAGENT_MCP_ALLOWED_HOSTS", "").split(",") if h.strip()}
+        install(fusion, bridge=McpBridge(url, token=os.environ.get("OPENAGENT_MCP_TOKEN", ""), allow_private=allow_private, allowed_hosts=allowed_hosts) if url else None)
+    return fusion
 
 
 def cmd_info(args: argparse.Namespace) -> int:
