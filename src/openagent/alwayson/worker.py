@@ -73,9 +73,51 @@ class Worker:
         try:
             ctx = self.fusion.ctx(event.session_id, reply_to, now, run_id)
             # an approval answer is read BEFORE a run starts
+            held_digest_resume: str | None = None
+            resume_system = ""
+            parked_row = self.conn.execute("SELECT resume_state FROM parked WHERE approver_session = ?", (event.session_id,)).fetchone()
+            if parked_row:
+                try:
+                    rs = json.loads(parked_row["resume_state"] or "{}")
+                    if isinstance(rs, dict):
+                        resume_system = str(rs.get("system") or "")
+                except Exception:
+                    pass
+            def _resume_before_tool(name: str, args: dict) -> tuple[str, str]:
+                nonlocal held_digest_resume
+                decision = self.fusion.guard.decide(name, args, ctx)
+                if decision.verdict == "deny":
+                    return "deny", f"Refused by the guard: {decision.reason}"
+                if decision.verdict == "hold":
+                    target = outbox.parse_address(self.fusion.owner)
+                    if target is None:
+                        return "deny", f"Owner address {self.fusion.owner!r} is not a routable address; cannot request approval."
+                    digest = approvals.park(self.conn, approver=self.fusion.owner, origin_session=event.session_id,
+                                            origin_address=outbox.format_address(reply_to.get("via", ""), reply_to) if reply_to else "", tool=name, args=args, now=now)
+                    if digest is None:
+                        return "deny", "Another call is already waiting for the owner's yes. Try later."
+                    held_digest_resume = digest
+                    outbox.insert(self.conn, run_id=run_id, channel=target[0], target=target[1],
+                                  body=approvals.question(name, args), idempotency_key=f"approval:{digest}", now=now)
+                    return "hold", "This call needs the owner's approval and has been asked. Do not say it was done. It runs only after a yes."
+                return "allow", ""
+            def _resume_on_hold(held_call: dict, held_messages: list[dict], batch_uses: list[dict]) -> None:
+                if held_digest_resume is None:
+                    return
+                # best-effort: reuse current snapshot/system context is not stored here; the resume_state from original park remains authoritative
+                approvals.set_resume_state(self.conn, self.fusion.owner, held_digest_resume, {
+                    "version": 1,
+                    "session_id": event.session_id,
+                    "reply_to": reply_to,
+                    "system": resume_system,
+                    "messages": held_messages,
+                    "held_call": held_call,
+                    "batch_uses": batch_uses,
+                    "max_iterations": self.fusion.max_iterations,
+                })
             outcome = (approvals.answer(self.conn, session_id=event.session_id, text=text, now=now,
                                         guard=self.fusion.guard, tools=self.fusion.tools, ctx=ctx,
-                                        observer=self.observer)
+                                        observer=self.observer, llm=self.fusion.llm, before_tool=_resume_before_tool, on_hold=_resume_on_hold)
                        if self.is_owner(event.session_id) else None)
             if outcome is not None:
                 out.handled, out.reply = "approval", outcome
@@ -92,13 +134,16 @@ class Worker:
                         self.conn.commit()
                         out.handled, out.reply = "command", "Session cleared."
                     elif command == "/dream":
-                        res = self.fusion.run_dream(now, force=True)
+                        res = self.fusion.run_dream(now, force=True, session_id=event.session_id)
                         out.handled, out.reply = "command", f"Dream ran={res.ran} kept={len(res.kept)} dropped={len(res.dropped)} commit={res.commit or 'none'}"
                     elif command == "/revert":
                         if not arg:
                             out.handled, out.reply = "command", "Usage: /revert <sha>"
                         else:
                             ok = self.fusion.audit.revert(arg, self.fusion.semantic)
+                            if ok:
+                                self.fusion._snapshots.clear()
+                                self.fusion._recalled.clear()
                             out.handled, out.reply = "command", (f"Reverted {arg}." if ok else f"Could not revert {arg}.")
                     else:
                         out.handled, out.reply = "command", f"Unknown admin command {command}."

@@ -117,23 +117,33 @@ class DreamResult:
     error: str = ""
 
 
-def chats_since_cursor(conn: sqlite3.Connection) -> tuple[list[sqlite3.Row], int]:
-    cursor = int(kv_get(conn, "dream_cursor", "0"))
-    rows = conn.execute("SELECT id, role, content FROM chat_log WHERE id > ? ORDER BY id",
-                        (cursor,)).fetchall()
+def _dream_cursor_key(session_id: str | None) -> str:
+    return f"dream_cursor:{session_id}" if session_id else "dream_cursor"
+
+
+def chats_since_cursor(conn: sqlite3.Connection, session_id: str | None = None) -> tuple[list[sqlite3.Row], int]:
+    cursor = int(kv_get(conn, _dream_cursor_key(session_id), "0"))
+    if session_id:
+        rows = conn.execute(
+            "SELECT id, role, content FROM chat_log WHERE session_id = ? AND id > ? ORDER BY id",
+            (session_id, cursor)).fetchall()
+    else:
+        rows = conn.execute("SELECT id, role, content FROM chat_log WHERE id > ? ORDER BY id",
+                            (cursor,)).fetchall()
     return rows, cursor
 
 
-def dream_due(conn: sqlite3.Connection, every_n: int) -> bool:
-    rows, _ = chats_since_cursor(conn)
+def dream_due(conn: sqlite3.Connection, every_n: int, session_id: str | None = None) -> bool:
+    rows, _ = chats_since_cursor(conn, session_id=session_id)
     return sum(1 for r in rows if r["role"] == "user") >= every_n
 
 
 def run_dream(conn: sqlite3.Connection, llm: LLM, semantic: SemanticMemory,
               curated: CuratedMemory, audit: MemoryAudit, *, now: datetime,
               recalled: str = "", every_n: int = 4, force: bool = False,
+              session_id: str | None = None,
               observer=lambda kind, ev=None: None) -> DreamResult:
-    rows, _ = chats_since_cursor(conn)
+    rows, _ = chats_since_cursor(conn, session_id=session_id)
     users = sum(1 for r in rows if r["role"] == "user")
     if not rows or (not force and users < every_n):
         return DreamResult()
@@ -178,7 +188,7 @@ def run_dream(conn: sqlite3.Connection, llm: LLM, semantic: SemanticMemory,
 
     if result.episode:
         semantic.add_episode(now.date().isoformat(), result.episode)
-    kv_set(conn, "dream_cursor", str(rows[-1]["id"]))        # only after success
+    kv_set(conn, _dream_cursor_key(session_id), str(rows[-1]["id"]))        # only after success
     export_wiki(semantic, curated.root)
     result.commit = audit.commit(f"dream {now.date().isoformat()}: +{len(result.kept)} kept, "
                                  f"{len(result.dropped)} dropped")

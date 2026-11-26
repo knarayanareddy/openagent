@@ -25,7 +25,7 @@ def fts_query(text: str) -> str:
     * Everything is lowercased because FTS5 reads AND/OR/NOT only in UPPERCASE,
       so a user's "Alex and Bob" never parses as a boolean expression.
     """
-    words = re.findall(r"[^\W_]{2,}", text.lower())
+    words = re.findall(r"[\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff\uac00-\ud7af]|[^\W_]{2,}", text.lower())
     return " OR ".join(dict.fromkeys(words))
 
 
@@ -78,7 +78,7 @@ class SemanticMemory:
         for e in episodes:
             happened_at = str(e.get("happened_at", "")).strip()
             summary = str(e.get("summary", "")).strip()
-            if happened_at and summary:
+            if happened_at and summary and scan_threat(summary) is None:
                 self.conn.execute("INSERT INTO episodes (happened_at, summary) VALUES (?, ?)",
                                   (happened_at, summary))
         self.conn.commit()
@@ -147,11 +147,15 @@ class SemanticMemory:
         episodes = self.search_episodes(query)
         lines = []
         for f in facts:
-            if scan_threat(f"{f.get('subject','')} {f.get('content','')}") is None:
-                lines.append(f"- {f['content']}")
+            subject = str(f.get('subject', '')).strip()
+            content = str(f.get('content', '')).strip()
+            if scan_threat(f"{subject} {content}") is None:
+                label = f"{subject}: " if subject else ""
+                lines.append(f"- {label}{content}")
         for e in episodes:
-            if scan_threat(str(e.get("summary", ""))) is None:
-                lines.append(f"- ({e['happened_at']}) {e['summary']}")
+            summary = str(e.get("summary", "")).strip()
+            if scan_threat(summary) is None:
+                lines.append(f"- ({e['happened_at']}) {summary}")
         return "\n".join(lines)
 
 
@@ -162,7 +166,7 @@ class SemanticMemory:
             subject = str(f.get("subject", "")).strip()
             content = str(f.get("content", "")).strip()
             source = str(f.get("source", "wiki"))
-            if subject and content:
+            if subject and content and scan_threat(f"{subject} {content}") is None:
                 self.conn.execute("INSERT INTO facts (subject, content, source) VALUES (?, ?, ?)",
                                   (subject, content, source))
         self.conn.commit()

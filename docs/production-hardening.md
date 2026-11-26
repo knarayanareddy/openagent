@@ -122,3 +122,23 @@ CI should include:
 - [ ] Authz policy configured with least privilege.
 - [ ] Token/HMAC secrets rotated and stored in secret manager.
 - [ ] CI green including adversarial and e2e jobs.
+
+## Status update (review 18ZXu8JDjh0UA-fAe_-pYPwFyzntYK8_m follow-up)
+
+### Closed/implemented in-repo
+- **Trusted proxy IP policy**: `openagent serve --trusted-proxies` / `OPENAGENT_TRUSTED_PROXIES` now only honors `X-Forwarded-For` from trusted proxy peers; direct peer IP is used otherwise.
+- **Ingress reply_to validation**: HTTP ingress accepts only valid `stdout|local|cli` reply targets, preventing external exfiltration via unvalidated reply_to.
+- **Threaded HTTP ingress**: serve uses `ThreadingHTTPServer` to reduce single-request blocking; handler timeout remains configured. Full slowloris protection still requires a reverse proxy/WAF.
+- **Audit hash-chain locking**: ingress audit hash chaining is computed/written under a lock.
+- **Rate limiter pruning**: in-memory limiter prunes stale keys to bound growth. Distributed/shared rate limiting remains deployment-specific.
+- **Durable approval resume (best-effort)**: parked approvals persist resume state (`resume_state`) including messages/system/held call; approval answers can resume the turn via LLM loop continuation, reducing duplicate side effects. A reverse proxy and durable process manager are still recommended.
+- **Pluggable threat scanner runtime wiring**: `openagent.security.wire_default_scanner()` is installed at Fusion init; curated/semantic memory writes go through regex baseline plus optional extra scanner hook. This is defense-in-depth, not a prompt-injection guarantee.
+- **FTS single-CJK query tokens**: `fts_query` keeps single CJK/Hangul/Kana tokens for NEW-14.
+
+### Still requires external infrastructure / operator action
+- **mTLS**: terminate or enforce mTLS at ingress proxy/service mesh (Envoy/Nginx/Traefik/Istio). Repo provides hooks/config docs only; do not claim in-repo mTLS without environment cert management.
+- **TLS termination**: run behind TLS-terminating reverse proxy/load balancer; bind OpenAgent to private interface/loopback.
+- **Distributed/shared rate limiting**: replace/process-augment `_RateLimiter` with Redis/API gateway/WAF rate limits for multi-instance deployments.
+- **External WORM/tamper-proof audit**: forward `logs/ingress.jsonl` and audit records to append-only/WORM storage (e.g., S3 Object Lock, immutability-configured log sink). In-repo hash chain detects local tampering but is not WORM.
+- **Full slowloris/header abuse protection**: enforce at reverse proxy (request/header/body timeouts, max header size/count, connection limits).
+- **Prompt injection immunity**: not guaranteeable. Keep regex + pluggable scanner + memory context boundaries + owner-only sensitive tool rules; evaluate with adversarial corpus and external model/classifier if needed.

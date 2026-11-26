@@ -86,10 +86,16 @@ def _response_from_openai(data: dict) -> Response:
         blocks.append({"type": "text", "text": text})
     for tc in msg.get("tool_calls") or []:
         fn = tc.get("function", {})
-        try:
-            args = json.loads(fn.get("arguments") or "{}")
-        except json.JSONDecodeError:
-            args = {"_raw": fn.get("arguments", "")}
+        raw_args = fn.get("arguments")
+        if isinstance(raw_args, dict):
+            args = raw_args
+        else:
+            try:
+                args = json.loads(raw_args or "{}")
+            except Exception:
+                args = {"_raw": str(raw_args or "")}
+        if not isinstance(args, dict):
+            args = {"value": args}
         blocks.append({
             "type": "tool_use",
             "id": tc.get("id", f"call_{fn.get('name','tool')}"),
@@ -167,9 +173,9 @@ class OpenAIProvider:
             except urllib.error.HTTPError as e:
                 detail = e.read().decode("utf-8", errors="replace")
                 last_err = RuntimeError(f"OpenAI API {e.code}: {detail[:500]}")
-                if e.code in {429, 500, 502, 503, 504} and attempt < 2:
+                if e.code in {429, 500, 502, 503, 504, 529} and attempt < 2:
                     retry_after = e.headers.get("retry-after") if e.headers else None
-                    delay = 0.05 * (2 ** attempt)
+                    delay = (0.25 * (2 ** attempt)) + (0.05 * (attempt + 1))
                     if retry_after is not None:
                         try:
                             delay = float(retry_after)
@@ -179,7 +185,7 @@ class OpenAIProvider:
                                 delay = dt.timestamp() - time.time()
                             except Exception:
                                 pass
-                    time.sleep(min(max(delay, 0.0), 5.0))
+                    time.sleep(min(max(delay, 0.0), 8.0))
                     continue
                 raise last_err from e
             except (urllib.error.URLError, TimeoutError, OSError) as e:

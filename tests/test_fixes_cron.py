@@ -35,25 +35,19 @@ def test_cron_dst_fall_back_monotonic():
 
 
 def test_f02_cron_dst_spring_forward_skips_missing_time():
-    try:
-        tz = "America/New_York"
-        # 2026-03-08 02:30 local does not exist (spring forward). Should land on next day 02:30.
-        after = datetime(2026, 3, 8, 6, 0, tzinfo=UTC)  # 01:00 EST
-        got = next_cron("30 2 * * *", after, tz)
-        got_local = got.astimezone(__import__("zoneinfo").ZoneInfo(tz))
-        assert (got_local.month, got_local.day, got_local.hour, got_local.minute) == (3, 9, 2, 30)
-    except Exception as e:  # noqa: BLE001
-        import pytest
-        pytest.skip(f"tzdata unavailable: {e}")
+    zoneinfo = pytest.importorskip("zoneinfo")
+    tz = "America/New_York"
+    # 2026-03-08 02:30 local does not exist (spring forward). Should land on next day 02:30.
+    after = datetime(2026, 3, 8, 6, 0, tzinfo=UTC)  # 01:00 EST
+    got = timers.next_cron("30 2 * * *", tz, after)
+    got_local = got.astimezone(zoneinfo.ZoneInfo(tz))
+    assert (got_local.month, got_local.day, got_local.hour, got_local.minute) == (3, 9, 2, 30)
 
 
 def test_f02_cron_dst_fall_back_picks_first_occurrence():
-    try:
-        tz = "America/New_York"
-        # 2026-11-01 01:30 occurs twice; our cron should fire at first occurrence (fold 0/earlier UTC instant).
-        after = datetime(2026, 11, 1, 4, 0, tzinfo=UTC)  # before 01:30 EDT
-        got = next_cron("30 1 * * *", after, tz)
-        assert got == datetime(2026, 11, 1, 5, 30, tzinfo=UTC)
-    except Exception as e:  # noqa: BLE001
-        import pytest
-        pytest.skip(f"tzdata unavailable: {e}")
+    pytest.importorskip("zoneinfo")
+    tz = "America/New_York"
+    # 2026-11-01 01:30 occurs twice; our cron should fire at first occurrence (fold 0/earlier UTC instant).
+    after = datetime(2026, 11, 1, 4, 0, tzinfo=UTC)  # before 01:30 EDT
+    got = timers.next_cron("30 1 * * *", tz, after)
+    assert got == datetime(2026, 11, 1, 5, 30, tzinfo=UTC)

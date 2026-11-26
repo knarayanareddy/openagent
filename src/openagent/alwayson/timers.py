@@ -39,7 +39,13 @@ class ActiveHours:
 
 
 def _minutes(value: str) -> int:
-    return int(value[:2]) * 60 + int(value[3:5])
+    parts = str(value).strip().split(":")
+    if len(parts) != 2:
+        raise ValueError(f"invalid HH:MM clock value: {value!r}")
+    h, m = int(parts[0]), int(parts[1])
+    if not (0 <= h <= 24 and 0 <= m <= 59 and not (h == 24 and m > 0)):
+        raise ValueError(f"clock value out of range: {value!r}")
+    return h * 60 + m
 
 
 def within_active_hours(active: ActiveHours | None, now: datetime) -> bool:
@@ -93,8 +99,8 @@ def _parse_cron(expr: str) -> tuple[set[int], set[int], set[int], set[int], set[
     dom = _cron_field(parts[2], 1, 31)
     month = _cron_field(parts[3], 1, 12)
     dow = _cron_field(parts[4], 0, 6)
-    dom_star = parts[2].strip() == '*'
-    dow_star = parts[4].strip() == '*'
+    dom_star = parts[2].strip() in ('*', '*/1') or dom == set(range(1, 32))
+    dow_star = parts[4].strip() in ('*', '*/1') or dow == set(range(0, 7))
     # Reject impossible day/month combinations (e.g. Feb 31, Apr 31)
     max_days = {1: 31, 2: 29, 3: 31, 4: 30, 5: 31, 6: 30, 7: 31, 8: 31, 9: 30, 10: 31, 11: 30, 12: 31}
     if not dom_star and not any(any(d <= max_days[m] for d in dom) for m in month):
@@ -131,15 +137,14 @@ def next_cron(expr: str, tz: str, after: datetime) -> datetime:
         if local.minute in mins and local.hour in hours and local.month in month:
             dom_ok = local.day in dom
             dow_ok = local.weekday() in {cron_dow_py[d] for d in dow}
-            day_ok = dom_ok and dow_ok if (not dom_star and not dow_star) else (dow_ok if dom_star else (dom_ok if dow_star else True))
-            if not dom_star and not dow_star:
-                day_ok = dom_ok or dow_ok
-            elif dom_star and dow_star:
+            if dom_star and dow_star:
                 day_ok = True
             elif dom_star:
                 day_ok = dow_ok
-            else:
+            elif dow_star:
                 day_ok = dom_ok
+            else:
+                day_ok = dom_ok or dow_ok
             if day_ok:
                 return cur_utc
         cur_utc += timedelta(minutes=1)
@@ -164,7 +169,10 @@ def first_fire(kind: str, spec: str, tz: str, now: datetime) -> datetime:
     if kind == "at":
         return parse_stamp(spec)
     if kind == "every":
-        return now + timedelta(seconds=int(spec))
+        secs = int(spec)
+        if secs <= 0:
+            raise ValueError(f"every timer spec must be > 0 seconds, got {spec!r}")
+        return now + timedelta(seconds=secs)
     if kind == "daily":
         return _next_daily(spec, tz, now)
     if kind == "cron":
@@ -175,6 +183,12 @@ def first_fire(kind: str, spec: str, tz: str, now: datetime) -> datetime:
 def add(conn: sqlite3.Connection, *, session_id: str, reply_to: dict, kind: str, spec: str,
         message: str, now: datetime, tz: str = "UTC", active_start: str | None = None,
         active_end: str | None = None) -> int:
+    if active_start is not None:
+        active_start = str(active_start).strip()
+        _minutes(active_start)  # validate
+    if active_end is not None:
+        active_end = str(active_end).strip()
+        _minutes(active_end)  # validate
     fire = first_fire(kind, spec, tz, now)
     cur = conn.execute(
         "INSERT INTO timers (session_id, reply_to, kind, spec, message, next_fire_at, tz, "

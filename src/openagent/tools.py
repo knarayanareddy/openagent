@@ -78,6 +78,8 @@ def _remember_preference(args: dict, ctx: Ctx) -> str:
         return json.dumps({"success": False, "error": "target must be 'user' or 'memory'"})
     entry = str(args.get("entry", ""))
     old_text = str(args.get("old_text", ""))
+    if action in ("replace", "remove") and not old_text.strip():
+        old_text = entry
     if action == "replace":
         result = ctx.curated.replace(target, old_text, entry)
     elif action == "remove":
@@ -100,11 +102,21 @@ def _book_meeting(args: dict, ctx: Ctx) -> str:
 
 
 def _schedule_task(args: dict, ctx: Ctx) -> str:
-    timers.add(ctx.conn, session_id=ctx.session_id, reply_to=ctx.reply_to, kind=args["kind"],
-               spec=args["spec"], message=args["message"], now=ctx.now,
-               tz=args.get("tz", "UTC"), active_start=args.get("active_start"),
-               active_end=args.get("active_end"))
-    return f"timer set: {args['kind']} {args['spec']}"
+    kind = str(args.get("kind", "")).strip().lower()
+    spec = str(args.get("spec", "")).strip()
+    message = str(args.get("message", "")).strip()
+    tz = str(args.get("tz", "UTC") or "UTC").strip()
+    active_start = args.get("active_start")
+    active_end = args.get("active_end")
+    if not kind or not spec or not message:
+        return "error: kind, spec, and message are required"
+    try:
+        timers.add(ctx.conn, session_id=ctx.session_id, reply_to=ctx.reply_to, kind=kind,
+                   spec=spec, message=message, now=ctx.now,
+                   tz=tz, active_start=active_start, active_end=active_end)
+    except Exception as exc:  # noqa: BLE001
+        return f"error: invalid timer: {exc}"
+    return f"timer set: {kind} {spec}"
 
 
 def _send_message(args: dict, ctx: Ctx) -> str:
@@ -155,6 +167,13 @@ def _send_rule(args: dict, ctx: object) -> Decision:
     return Decision(HOLD, "a message to anyone else is a write to a third party")
 
 
+def _owner_only(_args: dict, ctx: object) -> Decision:
+    assert isinstance(ctx, Ctx)
+    if ctx.owner_addresses and ctx.session_id in ctx.owner_addresses:
+        return Decision(ALLOW)
+    return Decision(DENY, "only the owner session may modify curated memory")
+
+
 def default_rules() -> dict[str, Callable[[dict, object], Decision]]:
-    return {"remember_preference": _always, "recall": _always, "book_meeting": _always,
+    return {"remember_preference": _owner_only, "recall": _always, "book_meeting": _always,
             "schedule_task": _always, "send_message": _send_rule}
