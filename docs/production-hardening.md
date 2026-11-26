@@ -123,6 +123,15 @@ CI should include:
 - [ ] Token/HMAC secrets rotated and stored in secret manager.
 - [ ] CI green including adversarial and e2e jobs.
 
+## MCP bridge hardening (persistent patterns)
+
+- MCP is disabled unless `OPENAGENT_MCP_URL` is configured.
+- `McpBridge` enforces `http/https`, rejects redirects, caps response size, and blocks private/loopback/resolved-private hosts by default.
+- Explicit opt-ins:
+  - `OPENAGENT_MCP_ALLOW_PRIVATE=1` — allow loopback/private targets (trusted local MCP servers only).
+  - `OPENAGENT_MCP_ALLOWED_HOSTS=host1,host2` — hostname allowlist policy.
+- Remote MCP tools are still guard-gated: `readOnlyHint=true` may be allowed; non-read-only/unknown tools require approval or are denied per bridge/guard policy.
+
 ## Status update (review 18ZXu8JDjh0UA-fAe_-pYPwFyzntYK8_m follow-up)
 
 ### Closed/implemented in-repo

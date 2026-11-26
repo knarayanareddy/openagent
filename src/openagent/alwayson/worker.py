@@ -20,7 +20,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 
-from openagent.agent import Fusion
+from openagent.agent import QUIET, Fusion
 from openagent.alwayson import approvals, breaker, events, outbox, timers
 from openagent.guard import ADMIN_COMMANDS, DENY_CMD, FILTER, gate_command
 
@@ -151,6 +151,9 @@ class Worker:
                 else:
                     turn = self.fusion.respond(event.session_id, text, reply_to, now)
                     out.handled, out.reply, out.parked = "run", turn.reply, turn.loop.parked
+            if out.reply.strip() == QUIET:
+                self.observer("quiet", {"title": "reply was [quiet]; nothing queued"})
+                out.reply = ""
             if out.reply and reply_to:
                 channel = reply_to["via"]
                 target = {k: v for k, v in reply_to.items() if k != "via"}
